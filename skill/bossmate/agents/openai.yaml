@@ -1,0 +1,7 @@
+interface:
+  display_name: "BossMate"
+  short_description: "Local AI-agent BOSS search with evidence and send gates"
+  default_prompt: "Use $bossmate to configure my profile and run a safe BOSS job-search workflow."
+
+policy:
+  allow_implicit_invocation: true

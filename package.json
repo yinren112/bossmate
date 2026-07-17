@@ -1,0 +1,44 @@
+{
+  "name": "bossmate",
+  "version": "0.1.0",
+  "description": "AI-native BOSS job-search skill with local browser control, evidence gates, and recruiter deduplication.",
+  "keywords": [
+    "agent-skill",
+    "ai-agent",
+    "boss-zhipin",
+    "job-search",
+    "codex",
+    "claude-code",
+    "opencode",
+    "hermes"
+  ],
+  "license": "MIT",
+  "author": "yinren112",
+  "homepage": "https://github.com/yinren112/bossmate#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yinren112/bossmate.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yinren112/bossmate/issues"
+  },
+  "bin": {
+    "bossmate": "bin/bossmate.js"
+  },
+  "files": [
+    "bin/",
+    "skill/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node tests/install.test.js && node skill/bossmate/scripts/test.js && node skill/bossmate/scripts/privacy-scan.js && node scripts/release-check.js",
+    "pack:check": "npm pack --dry-run"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
