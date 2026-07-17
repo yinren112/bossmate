@@ -90,14 +90,17 @@ npx github:yinren112/bossmate
 
 ## 它怎样工作
 
-```mermaid
-flowchart LR
-    A["① 认识你<br/>简历 · 意向"]
-    B["② 找岗位<br/>完整 JD · 证据筛选"]
-    C["③ 安全沟通<br/>去重 · 定制 · 门禁"]
-    D["④ 确认结果<br/>送达 · 台账"]
-    A --> B --> C --> D
-```
+<table>
+  <tr>
+    <td align="center"><strong>① 认识你</strong><br>简历 · 意向</td>
+    <td align="center">→</td>
+    <td align="center"><strong>② 找岗位</strong><br>完整 JD · 证据筛选</td>
+    <td align="center">→</td>
+    <td align="center"><strong>③ 安全沟通</strong><br>去重 · 定制 · 门禁</td>
+    <td align="center">→</td>
+    <td align="center"><strong>④ 确认结果</strong><br>送达 · 台账</td>
+  </tr>
+</table>
 
 AI Agent 负责理解简历、判断 JD 和写自然的沟通内容；随 Skill 安装的本地脚本负责浏览器控制、台账、去重、发送门禁和送达核验。判断和执行分开，避免 Agent 仅凭聊天记忆决定是否发送。
 
