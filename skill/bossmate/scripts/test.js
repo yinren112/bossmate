@@ -23,6 +23,19 @@ try {
   assert(fs.existsSync(path.join(home, 'preferences.json')));
   assert(fs.existsSync(path.join(home, 'data', 'ledger.json')));
 
+  const browserHome = path.join(home, 'browser-dry-run');
+  result = run('setup-browser.js', [
+    '--dry-run',
+    `--home=${browserHome}`,
+    `--executable=${process.execPath}`,
+  ]);
+  assert.equal(result.status, 0, result.stderr);
+  const browserPlan = JSON.parse(result.stdout);
+  assert.equal(browserPlan.dryRun, true);
+  assert.equal(browserPlan.port, 9222);
+  assert.equal(browserPlan.profile, path.join(browserHome, 'browser-profile'));
+  assert.equal(fs.existsSync(browserHome), false, 'browser dry-run must not create files');
+
   const preferencesFile = path.join(home, 'preferences.json');
   const preferences = JSON.parse(fs.readFileSync(preferencesFile, 'utf8'));
   preferences.onboarding = { confirmed: true, confirmedAt: new Date().toISOString() };
@@ -111,7 +124,7 @@ try {
   assert(!/codex(?:\.ps1)?/i.test(source), 'runtime must not invoke Codex');
   assert(!/C:[/\\]Users[/\\]/i.test(source), 'runtime must not contain a private Windows path');
 
-  console.log('TEST_OK setup + review + opener + approval gate + validation');
+  console.log('TEST_OK setup + browser launcher + review + opener + approval gate + validation');
 } finally {
   fs.rmSync(home, { recursive: true, force: true });
 }

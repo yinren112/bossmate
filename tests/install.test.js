@@ -31,6 +31,8 @@ try {
     path.join(home, '.workbuddy', 'skills', 'bossmate', 'SKILL.md'),
   ];
   targets.forEach(file => assert(fs.existsSync(file), file));
+  assert(fs.existsSync(path.join(path.dirname(targets[0]), 'scripts', 'setup-browser.js')));
+  assert(!fs.existsSync(path.join(path.dirname(targets[0]), 'scripts', 'setup-browser.ps1')));
 
   result = run(['--agent', 'all', '--scope', 'user', '--yes']);
   assert.equal(result.status, 0, result.stderr);
