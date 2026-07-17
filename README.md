@@ -20,23 +20,29 @@ Everything private stays on your computer.
 No clone required:
 
 ```bash
-npx github:yinren112/bossmate
+npx bossmate
 ```
 
 Install for one agent:
 
 ```bash
-npx github:yinren112/bossmate --agent codex
-npx github:yinren112/bossmate --agent claude
-npx github:yinren112/bossmate --agent opencode
-npx github:yinren112/bossmate --agent hermes
-npx github:yinren112/bossmate --agent workbuddy
+npx bossmate --agent codex
+npx bossmate --agent claude
+npx bossmate --agent opencode
+npx bossmate --agent hermes
+npx bossmate --agent workbuddy
 ```
 
 Install into the current project instead of your user profile:
 
 ```bash
-npx github:yinren112/bossmate --agent all --scope project
+npx bossmate --agent all --scope project
+```
+
+GitHub fallback:
+
+```bash
+npx github:yinren112/bossmate
 ```
 
 Then tell your agent:
