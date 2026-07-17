@@ -9,7 +9,7 @@ The bundled launcher is verified for Windows with Edge or Chrome and Node.js 22+
 From the Skill root:
 
 ```powershell
-pwsh -File scripts/setup-browser.ps1 -Browser edge -Port 9222
+node scripts/setup-browser.js --browser=edge --port=9222
 ```
 
 The script:
