@@ -12,7 +12,6 @@
     "cityCode": "100010000",
     "cityName": "全国"
   },
-  "mode": "review",
   "requirements": {
     "workLocation": "",
     "remotePolicy": "",
