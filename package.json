@@ -1,6 +1,6 @@
 {
   "name": "bossmate",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "AI-native BOSS job-search skill with local browser control, evidence gates, and recruiter deduplication.",
   "keywords": [
     "agent-skill",
