@@ -22,10 +22,7 @@ Ask at most two questions at a time. Do not make the user design the schema.
 2. Extract only verifiable facts, evidence links, target roles, and facts that must not be claimed.
 3. Ask for primary and adjacent roles.
 4. Ask for location/remote requirements, employment types, minimum compensation, schedule limits, and hard exclusions.
-5. Ask once whether to use:
-   - `review`: require explicit approval for each job before sending;
-   - `autopilot`: send automatically only after every configured rule and runtime gate passes.
-6. Show the resulting facts and preferences once for confirmation.
+5. Show the resulting facts and preferences once for confirmation.
 
 ## Write private files
 
@@ -39,7 +36,7 @@ Update `<home>/preferences.json`:
 
 - create one profile per target role family;
 - use real title/JD keywords supplied or confirmed by the user;
-- set city, browser, compensation, exclusions, opener limits, and mode;
+- set city, browser, compensation, exclusions, and opener limits;
 - add risky or unsupported claims to `opener.bannedClaims`;
 - set `onboarding.confirmed` to `true` only after the user confirms the summary;
 - record `confirmedAt` as an ISO timestamp.

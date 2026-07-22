@@ -39,7 +39,6 @@ try {
   const preferencesFile = path.join(home, 'preferences.json');
   const preferences = JSON.parse(fs.readFileSync(preferencesFile, 'utf8'));
   preferences.onboarding = { confirmed: true, confirmedAt: new Date().toISOString() };
-  preferences.mode = 'review';
   fs.writeFileSync(preferencesFile, JSON.stringify(preferences, null, 2) + '\n');
   fs.writeFileSync(path.join(home, 'profile.md'), '# Confirmed facts\n\n- Built and shipped one real software project.\n');
 
@@ -77,7 +76,6 @@ try {
     },
     preScreen: { status: 'priority', profile: 'primary', score: 60, activityRank: 0, reasons: [] },
     opener: { status: 'none', message: '', profile: '', jdHash: '' },
-    approval: { status: 'not_required', approvedAt: '' },
     outreach: { status: 'not_sent', message: '', verify: null },
     reply: { status: 'unknown' }
   };
@@ -107,24 +105,17 @@ try {
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /OPENER_SAVED/);
 
-  result = run('boss.js', ['send', 'fixture-job']);
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /尚未批准/);
-
-  result = run('boss.js', ['approve', 'fixture-job']);
-  assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /APPROVED/);
-
   result = run('boss.js', ['validate']);
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /VALID/);
 
   const source = fs.readFileSync(path.join(__dirname, 'boss.js'), 'utf8');
   assert(!source.includes('--force'), 'force-send option must not exist');
+  assert(!source.includes('assertApprovalReady'), 'obsolete approval gate must not return');
   assert(!/codex(?:\.ps1)?/i.test(source), 'runtime must not invoke Codex');
   assert(!/C:[/\\]Users[/\\]/i.test(source), 'runtime must not contain a private Windows path');
 
-  console.log('TEST_OK setup + browser launcher + review + opener + approval gate + validation');
+  console.log('TEST_OK setup + browser launcher + review + opener + direct-send gates + validation');
 } finally {
   fs.rmSync(home, { recursive: true, force: true });
 }
