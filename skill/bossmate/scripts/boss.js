@@ -40,23 +40,87 @@ function cdpLib() {
   return cachedCdp;
 }
 
+// ── 拟人节奏：所有等待都用随机区间，不用固定常数 ──
+// 固定间隔的等待是脚本化访问最容易被识别的特征之一——真人不会连续两次停顿完全相同的毫秒数。
+const sleepMs = ms => new Promise(resolve => setTimeout(resolve, Math.max(0, ms)));
+const rndInt = (lo, hi) => lo + Math.floor(Math.random() * (Math.max(hi, lo) - lo + 1));
+const humanPause = (lo, hi) => sleepMs(rndInt(lo, hi));
+
+const WINDOW_24H = 24 * 60 * 60 * 1000;
+const WINDOW_10MIN = 10 * 60 * 1000;
+// 深夜时段自动减速而不是禁止：既降低连续高强度访问的风险特征，也不强行打断用户自己的作息。
+const NIGHT_START_HOUR = 23; // 23:00
+const NIGHT_END_HOUR = 9;    // 09:00
+const NIGHT_PACE = 2;        // 深夜最小间隔翻倍、突发上限减半；24 小时总额度不变
+const isNightHour = (date = new Date()) => { const h = date.getHours(); return h >= NIGHT_START_HOUR || h < NIGHT_END_HOUR; };
+const paceMultiplier = (date = new Date()) => (isNightHour(date) ? NIGHT_PACE : 1);
+
 // ── 账号级熔断锁与安全检测 ──
 const LOCK_FILE = path.join(DATA_DIR, 'lock.json');
 const SECURITY_PAGE_RE = /security_check|captcha|verify|\/403\.html|[?&]code=(32|36|37)(?:&|$)|\/web\/passport\/|账户存在异常行为|暂时限制访问|访问受限/i;
+// 这些信号代表平台自己的风控已经判定过一次，而不是普通的加载失败或页面异常；
+// 出现后当天继续访问正是多起真实受限事件里共同的失败路径（信号出现后又继续访问几次，随后升级为账号级限制）。
+const SEVERE_LOCK_RE = /code=(?:32|36|37)|访问受限|账户存在异常|暂时限制访问|环境存在异常/;
 const ONLINE_COMMANDS = new Set(['check', 'replies', 'interactions', 'profile', 'search', 'read', 'opener-context', 'save-opener', 'send', 'verify-delivery', 'company-jobs']);
 const MAX_CONSECUTIVE_EMPTY_JD = 3;
-const MAX_DAILY_READS = 950;
 const JD_GARBAGE_RE = /微信扫码登录|扫码登录|请先登录|登录后查看|登录查看完整内容|手机验证码登录|密码登录/;
 
-function dailyReadCount(ledger) {
-  const today = new Date().toISOString().slice(0, 10);
-  return (ledger.jobs || []).filter(j => j.jd?.checkedAt && String(j.jd.checkedAt).slice(0, 10) === today).length;
+// ── 24 小时滚动速率闸门 ──
+// 真实受限案例里，详情页阅读量在同一账号单日约 1000 次左右就会触发访问限制，
+// 而对照的低量账号（几百次/日）当天没有异常；发送侧观察到的量级在 150 上下。
+// 下面的 hardCeiling24h 是留出安全余量后的保险丝，不是"可以放心用满"的目标值；
+// 日常运行应该长期停在 softLimit24h 以下，只有账号观察稳定几天后再考虑上调。
+// 三层闸门里，总量（24h）和密度（10min）超限会直接拒绝；只有"两次动作间隔不够"
+// 会自动等待补足，不会报错——间隔问题是节奏问题，不是异常，不该让脚本直接失败。
+const RATE_LIMITS = {
+  searchPages: { softLimit24h: 30, hardCeiling24h: 120, burstLimit10min: 6, minGapMs: 15000 },
+  jobReads: { softLimit24h: 300, hardCeiling24h: 900, burstLimit10min: 40, minGapMs: 8000 },
+  sends: { softLimit24h: 30, hardCeiling24h: 150, burstLimit10min: 6, minGapMs: 25000 },
+};
+
+// 速率计数直接从台账里已有的时间戳派生（详情页 jd.checkedAt/liveCheckedAt、发送 outreach.sentAt、
+// 搜索 runs[].at），不另开一份计数文件：不会和台账的真实历史脱节，也天然扛得住进程重启、
+// 上下文压缩——每次命令都是独立进程，一个内存变量式的计数器在这里等于形同虚设。
+function recentTimestamps(ledger, kind) {
+  if (kind === 'jobReads') return (ledger.jobs || []).flatMap(j => [j.jd?.checkedAt, j.jd?.liveCheckedAt]).filter(Boolean);
+  if (kind === 'searchPages') return (ledger.runs || []).filter(r => r.type === 'search').map(r => r.at).filter(Boolean);
+  if (kind === 'sends') return (ledger.jobs || []).map(j => j.outreach?.sentAt).filter(Boolean);
+  return [];
 }
 
-function assertDailyReadLimit(ledger) {
-  const count = dailyReadCount(ledger);
-  if (count >= MAX_DAILY_READS) {
-    throw new Error(`每日岗位详情页读取量已达上限 (${count}/${MAX_DAILY_READS})，已停止在线读取`);
+function countWithin(timestamps, windowMs, at = Date.now()) {
+  const floor = at - windowMs;
+  return timestamps.filter(t => (Date.parse(t) || 0) >= floor).length;
+}
+
+// 三层闸门：24 小时总量（软上限拒绝，硬上限直接写熔断锁）、10 分钟突发密度、
+// 与上一次同类动作的最小间隔。注意窗口是滚动的，不按自然日归零——
+// 昨晚 23 点和今天 0 点半的动作只隔 90 分钟，必须算进同一个窗口，
+// 不能因为跨了零点就各自重新计数到独立的"两天配额"。
+async function guardRate(kind, ledger, { lockFile = LOCK_FILE } = {}) {
+  const limits = RATE_LIMITS[kind];
+  if (!limits) return;
+  const timestamps = recentTimestamps(ledger, kind);
+  const pace = paceMultiplier();
+  const used24h = countWithin(timestamps, WINDOW_24H);
+  if (used24h >= limits.hardCeiling24h) {
+    throwSecurity(`${kind} 触到平台硬顶：24 小时内已 ${used24h}/${limits.hardCeiling24h}`, 'hard-ceiling', lockFile);
+  }
+  if (used24h >= limits.softLimit24h) {
+    throw new Error(`24 小时滚动额度已用完：${kind} ${used24h}/${limits.softLimit24h}，等窗口滑出再继续；不为凑数继续访问`);
+  }
+  const burstAllowed = Math.max(1, Math.floor(limits.burstLimit10min / pace));
+  const used10min = countWithin(timestamps, WINDOW_10MIN);
+  if (used10min >= burstAllowed) {
+    throw new Error(`10 分钟突发上限：${kind} ${used10min}/${burstAllowed}${pace > 1 ? '（深夜减半）' : ''}，先歇一会儿再继续`);
+  }
+  const gap = limits.minGapMs * pace;
+  const lastAt = timestamps.length ? Math.max(...timestamps.map(t => Date.parse(t) || 0)) : 0;
+  const since = Date.now() - lastAt;
+  if (gap && lastAt && since < gap) {
+    const wait = rndInt(gap - since, gap - since + Math.round(gap * 0.5));
+    console.error(`[节流] 距上次 ${kind} ${Math.round(since / 1000)}s，等待约 ${Math.round(wait / 1000)}s${pace > 1 ? '（深夜减半）' : ''}`);
+    await humanPause(wait, wait + 500);
   }
 }
 
@@ -78,27 +142,61 @@ function assertNotLocked(file = LOCK_FILE) {
   if (lock.locked) throw new Error(`账号熔断锁定中：${lock.reason}（${lock.lockedAt}）。禁止任何在线动作，人工确认后用 unlock --reason=说明 解除`);
 }
 
-function throwSecurity(reason, evidence = '') {
-  writeLock(reason, evidence);
+function throwSecurity(reason, evidence = '', file = LOCK_FILE) {
+  writeLock(reason, evidence, file);
   throw new Error(`${reason}，已停止并写入熔断锁 data/lock.json；人工确认前所有在线命令拒绝运行`);
 }
 
+// 平台级风控信号（code=32/36/37、访问受限等）当天不得解锁续跑：真实受限事件的共同失败路径
+// 就是"信号出现后继续访问几次"，而不是单次请求本身。普通异常（如 check 偶然发现的加载失败）
+// 不受此限制，可以随时解锁。
+function unlockRefusal(previous, at = Date.now()) {
+  if (!previous?.locked) return '';
+  if (!SEVERE_LOCK_RE.test(`${previous.reason || ''} ${previous.evidence || ''}`)) return '';
+  const lockedAt = Date.parse(previous.lockedAt || '') || 0;
+  if (!lockedAt) return '';
+  const sameDay = new Date(lockedAt).toDateString() === new Date(at).toDateString();
+  if (!sameDay && at - lockedAt >= WINDOW_24H) return '';
+  const earliest = new Date(lockedAt + WINDOW_24H).toLocaleString();
+  return `平台级风控信号当天不得解锁续跑：${previous.reason}，锁定于 ${previous.lockedAt}，最早可解锁 ${earliest}。确需提前解锁请加 --override-severe-lock 参数并自负风险`;
+}
+
+// 注意：这个开关只越过"风控级熔断当天冷静期"，不涉及发送、去重或送达核验任何一道门禁——
+// 那几道门禁本来就没有、也不该有绕过开关。
 function unlock() {
   const reason = arg('reason');
   if (!reason) throw new Error('解锁必须由人工给出 --reason=说明');
   const previous = loadLock();
-  fs.writeFileSync(LOCK_FILE, JSON.stringify({ locked: false, unlockedAt: now(), unlockReason: reason, previousLock: previous.locked ? previous : null }, null, 2));
+  const overrideCooldown = process.argv.includes('--override-severe-lock');
+  const refusal = unlockRefusal(previous);
+  if (refusal && !overrideCooldown) throw new Error(refusal);
+  fs.writeFileSync(LOCK_FILE, JSON.stringify({
+    locked: false, unlockedAt: now(), unlockReason: reason,
+    ...(overrideCooldown && refusal ? { cooldownOverride: refusal } : {}),
+    previousLock: previous.locked ? previous : null,
+  }, null, 2));
   console.log(`已解锁：${reason}${previous.locked ? `（上次锁定：${previous.reason} @ ${previous.lockedAt}）` : '（此前无锁定）'}`);
+  if (overrideCooldown && refusal) console.log(`⚠ 已用 --override-severe-lock 越过冷静期：${refusal}`);
 }
 
-let _consecutiveEmptyJd = 0;
+// 连续空白 JD 计数存进台账（ledger.safety），不用内存变量：每条命令都是独立进程，
+// 内存计数器每次调用都会归零，等于这道闸门从未真正生效过。
 function noteEmptyJd(message) {
-  _consecutiveEmptyJd++;
-  if (_consecutiveEmptyJd >= MAX_CONSECUTIVE_EMPTY_JD) {
-    throwSecurity(`连续 ${_consecutiveEmptyJd} 次空白/受限 JD（${message}）`, 'consecutive-empty-jd');
+  const ledger = loadLedger();
+  ledger.safety = ledger.safety || { consecutiveEmptyJd: 0 };
+  ledger.safety.consecutiveEmptyJd = (ledger.safety.consecutiveEmptyJd || 0) + 1;
+  saveLedger(ledger);
+  if (ledger.safety.consecutiveEmptyJd >= MAX_CONSECUTIVE_EMPTY_JD) {
+    throwSecurity(`连续 ${ledger.safety.consecutiveEmptyJd} 次空白/受限 JD（${message}）`, 'consecutive-empty-jd');
   }
 }
-function resetEmptyJd() { _consecutiveEmptyJd = 0; }
+function resetEmptyJd() {
+  const ledger = loadLedger();
+  if (ledger.safety?.consecutiveEmptyJd) {
+    ledger.safety.consecutiveEmptyJd = 0;
+    saveLedger(ledger);
+  }
+}
 
 function unreadableJobMessage(page) {
   const body = String(page?.bodyText || '');
@@ -115,7 +213,7 @@ const arg = name => {
   return hit ? hit.slice(name.length + 3) : '';
 };
 const jobIdOf = text => String(text || '').match(/zhipin\.com\/job_detail\/([^/?#]+?)\.html/i)?.[1] || '';
-const emptyLedger = () => ({ version: 2, updatedAt: now(), jobs: [], conversations: [], interactions: [], companies: [], runs: [] });
+const emptyLedger = () => ({ version: 2, updatedAt: now(), jobs: [], conversations: [], interactions: [], companies: [], runs: [], safety: { consecutiveEmptyJd: 0 } });
 
 function assertConfigured() {
   if (!fs.existsSync(PREFERENCES_FILE) || !fs.existsSync(FACTS_FILE)) {
@@ -498,6 +596,43 @@ function assertAgentReady(ledger, job) {
   if (reason) throw new Error(reason);
 }
 
+// 审核所需的最小载荷：agent 判断 remote/pay/risk 需要的字段 + JD 正文，一次给全。
+// 没有这个出口时，agent 想审岗必须先看 JD，想看 JD（opener-context）又必须先审完岗，
+// 唯一出路是直接去读 data/ledger.json——而台账每个岗位约 5KB，几百个岗位就足以塞爆上下文。
+// 这个函数存在的意义就是让"读台账"永远没有必要。
+function reviewPayload(job) {
+  const structured = job.jd?.structured || {};
+  return {
+    jobId: job.jobId,
+    title: job.title,
+    company: job.company,
+    salary: job.salary || structured.salary || '',
+    experience: structured.experience || '',
+    education: structured.education || '',
+    remoteHint: job.jd?.remoteHint || '',
+    recruiterActive: job.recruiter?.activeText || '',
+    jdStatus: job.jd?.status || 'unknown',
+    descriptionChars: String(structured.description || '').length,
+    description: structured.description || '',
+    benefits: structured.benefits || '',
+    review: Object.fromEntries(['remote', 'pay', 'risk'].map(k => [k, job.review?.[k]?.status || 'pending'])),
+    outreachStatus: job.outreach?.status || 'not_sent',
+  };
+}
+
+// 离线复看已读过的 JD，不联网、不占速率闸门。
+// 用于 agent 上下文被压缩后重新拿回某个岗位的正文，而不是去翻台账。
+function showJd() {
+  const input = process.argv[3] || arg('url');
+  const id = jobIdOf(input) || input;
+  const ledger = loadLedger();
+  const index = ledger.jobs.findIndex(x => x.jobId === id);
+  const job = index >= 0 ? hydrateLegacyStructured(ledger.jobs[index]) : null;
+  if (!job) throw new Error(`台账中没有岗位 ${id}`);
+  if (!String(job.jd?.structured?.description || '').trim()) throw new Error(`岗位 ${id} 尚无完整 JD 正文，请先运行 read`);
+  console.log(JSON.stringify(reviewPayload(job), null, 2));
+}
+
 
 
 // 只识别无法在当前页面关闭的硬性拦截；"完善在线简历"的"好的"提示会在发送页内关闭后继续。
@@ -507,29 +642,37 @@ function detectSendBlock(text) {
   return '';
 }
 
-function buildOpenerContext(job, profileId) {
+// brief=true 时省掉 userProfile 和 description 两个字段。
+// 这两块在一轮工作流里都是重复内容：JD 正文 agent 刚在 read --jd 里看过，
+// 事实档案（profile.md）整个 session 一个字都不会变，却被每个岗位重发一次——
+// 处理几十个岗位时，光这两项就占掉总载荷的一半以上。
+// brief 模式要求调用方确保 profile.md 已在本 session 加载过一次。
+function buildOpenerContext(job, profileId, brief = false) {
   const profile = PROFILES[profileId] || PROFILES[matchProfile(job.title, job.jd?.structured?.description || '')];
   if (!profile) throw new Error('岗位未匹配用户配置的求职方向，不能生成开场白');
-  const facts = fs.readFileSync(FACTS_FILE, 'utf8');
   const structured = job.jd?.structured || {};
-  return {
-    instruction: '根据用户事实档案和岗位 JD 撰写首次沟通开场白。只使用用户已确认的事实，不虚构任何经历，不写链接。',
+  const context = {
+    instruction: brief
+      ? '根据本 session 已加载的用户事实档案（profile.md）和下述岗位信息撰写首次沟通开场白。只使用用户已确认的事实，不虚构任何经历，不写链接。'
+      : '根据用户事实档案和岗位 JD 撰写首次沟通开场白。只使用用户已确认的事实，不虚构任何经历，不写链接。',
     profile: { id: profileId, label: profile.label, factFocus: profile.factFocus || '' },
     job: {
       jobId: job.jobId, title: job.title, company: job.company,
       salary: job.salary || structured.salary || '', experience: structured.experience || '',
-      education: structured.education || '', description: structured.description,
+      education: structured.education || '',
+      ...(brief ? {} : { description: structured.description }),
       benefits: structured.benefits || '',
     },
-    userProfile: facts,
+    ...(brief ? { userProfileSource: rel(FACTS_FILE) } : { userProfile: fs.readFileSync(FACTS_FILE, 'utf8') }),
     openerRules: PREFERENCES.opener || {},
   };
+  return context;
 }
 
-function openerContext(job, requestedProfile = '') {
+function openerContext(job, requestedProfile = '', brief = false) {
   if (job.jd?.status !== 'read' || !job.jd?.structured?.description || job.jd.structured.incomplete) throw new Error('未读取完整结构化 JD');
   const profileId = matchProfile(job.title, job.jd.structured.description, requestedProfile || job.preScreen?.profile);
-  return buildOpenerContext(job, profileId);
+  return buildOpenerContext(job, profileId, brief);
 }
 
 function verifyFrom(value) {
@@ -681,10 +824,10 @@ async function check() {
 }
 
 async function replies() {
-  const { openTab, closeTab, sleep } = cdpLib();
+  const { openTab, closeTab } = cdpLib();
   const cdp = await openTab('https://www.zhipin.com/web/geek/chat', PORT);
   try {
-    await sleep(3500);
+    await humanPause(3000, 6500);
     const raw = await cdp.eval(`(()=>{
       let vm=document.querySelector('.friend-content-warp')?.__vue__;
       while(vm&&vm.$options?.name!=='virtual-list')vm=vm.$parent;
@@ -723,14 +866,14 @@ async function replies() {
 }
 
 async function interactions() {
-  const { openTab, closeTab, sleep } = cdpLib();
+  const { openTab, closeTab } = cdpLib();
   const cdp = await openTab('https://www.zhipin.com/web/geek/recommend', PORT);
   const snapshots = [];
   try {
-    await sleep(3500);
+    await humanPause(3000, 6500);
     for (const label of ['谁看过我', '对我感兴趣的']) {
       await cdp.eval(`(()=>{const label=${JSON.stringify(label)};const el=[...document.querySelectorAll('span,a,li')].find(x=>(x.innerText||'').trim()===label&&x.offsetParent);if(!el)return false;el.click();return true})()`);
-      await sleep(1500);
+      await humanPause(1200, 2800);
       const raw = await cdp.eval(`JSON.stringify({text:document.body.innerText.replace(/\\s+/g,' ').slice(0,5000),links:[...document.querySelectorAll('a[href*="/job_detail/"]')].filter(a=>!a.href.includes('personal_added_job')).map(a=>({url:a.href,text:(a.innerText||'').trim()})).slice(0,30)})`);
       snapshots.push({ type: label, capturedAt: now(), ...JSON.parse(raw || '{}') });
     }
@@ -755,10 +898,10 @@ async function interactions() {
 }
 
 async function profile() {
-  const { openTab, closeTab, sleep } = cdpLib();
+  const { openTab, closeTab } = cdpLib();
   const cdp = await openTab('https://www.zhipin.com/web/geek/resume', PORT);
   try {
-    await sleep(3500);
+    await humanPause(3000, 6500);
     const raw = await cdp.eval(`JSON.stringify({url:location.href,security:location.href.includes('security_check')||!!document.querySelector('.security-check,.verify-wrap,.captcha'),expectations:document.querySelector('#purpose')?.innerText.replace(/\\s+/g,' ').trim()||'',advantage:document.querySelector('#summary .advantage-text')?.innerText.trim()||'',attachments:[...document.querySelectorAll('a')].filter(a=>/\\.pdf$/i.test((a.innerText||'').trim())).map(a=>(a.innerText||'').trim())})`);
     const snapshot = { ...JSON.parse(raw || '{}'), checkedAt: now() };
     const ledger = loadLedger();
@@ -775,12 +918,12 @@ async function readJob() {
   const input = process.argv[3] || arg('url');
   const id = jobIdOf(input) || (/^[\w-]+$/.test(input || '') ? input : '');
   const ledger = loadLedger();
-  assertDailyReadLimit(ledger);
   const existing = id ? ledger.jobs.find(x => x.jobId === id) : null;
   const url = jobIdOf(input) ? input : existing?.url;
   if (!id) throw new Error('需要有效的 BOSS 岗位详情链接');
   if (!url) throw new Error(`台账中没有岗位 ${id} 的详情链接`);
-  const { openTab, closeTab, sleep } = cdpLib();
+  await guardRate('jobReads', ledger);
+  const { openTab, closeTab } = cdpLib();
   const cdp = await openTab(url, PORT);
   try {
     let page = {};
@@ -789,7 +932,7 @@ async function readJob() {
       const raw = await cdp.eval(jobPageExpression());
       page = JSON.parse(raw || '{}');
       if (page.security || (jobIdOf(page.url) === id && String(page.structured?.description || '').trim())) break;
-      await sleep(750);
+      await humanPause(600, 1200);
     } while (Date.now() < deadline);
     if (page.security || jobIdOf(page.url) !== id) throwSecurity('岗位页进入安全验证或发生跳转', `${id} -> ${page.url || ''}`);
     if (!String(page.structured?.description || '').trim()) {
@@ -820,11 +963,17 @@ async function readJob() {
     }
     job.sources = [...new Set([...(job.sources || []), arg('source') || 'manual'])];
     saveLedger(ledger);
-    console.log(JSON.stringify({
-      status: job.jd.status, jobId: id, title: job.title, company: job.company, salary: job.salary,
-      remoteHint: job.jd.remoteHint, descriptionChars: job.jd.structured?.description?.length || 0,
-      recruiterActive: job.recruiter.activeText || '', activityRank: job.recruiter.activityRank || 0,
-    }, null, 2));
+    // --jd 直接带出审核所需的全部字段（含 JD 正文），省掉紧接着的第二次命令往返；
+    // 审岗本来就必须看正文，把它拆成两次调用只是多花一轮工具开销。
+    if (process.argv.includes('--jd')) {
+      console.log(JSON.stringify(reviewPayload(job), null, 2));
+    } else {
+      console.log(JSON.stringify({
+        status: job.jd.status, jobId: id, title: job.title, company: job.company, salary: job.salary,
+        remoteHint: job.jd.remoteHint, descriptionChars: job.jd.structured?.description?.length || 0,
+        recruiterActive: job.recruiter.activeText || '', activityRank: job.recruiter.activityRank || 0,
+      }, null, 2));
+    }
   } finally {
     cdp.close();
     await closeTab(cdp.tabId, PORT);
@@ -836,18 +985,22 @@ async function search() {
   const page = Number(arg('page') || 1);
   const requestedProfile = arg('profile');
   if (requestedProfile && !PROFILES[requestedProfile]) throw new Error(`未知岗位方向 ${requestedProfile}`);
-  if (!query || !Number.isInteger(page) || page < 1 || page > 10) throw new Error('需要搜索词，page 必须是 1–10');
-  const url = `https://www.zhipin.com/web/geek/jobs?query=${encodeURIComponent(query)}&city=${encodeURIComponent(CITY_CODE)}&page=${page}`;
-  const { openTab, closeTab, sleep } = cdpLib();
+  if (!query) throw new Error('需要搜索词');
+  // 搜索结果页是单页应用，?page= 参数会被前端忽略（p1/p2/p3 拿到的内容完全一样）；
+  // 真正翻页必须在页面里点分页按钮或滚动加载，用 URL 参数硬翻只会重复读同一屏还白占额度。
+  if (page !== 1) throw new Error('搜索页 ?page= 参数会被前端忽略，翻页请在页面内点分页按钮或滚动加载；此命令只接受 page=1');
+  const url = `https://www.zhipin.com/web/geek/jobs?query=${encodeURIComponent(query)}&city=${encodeURIComponent(CITY_CODE)}`;
+  const ledger = loadLedger();
+  await guardRate('searchPages', ledger);
+  const { openTab, closeTab } = cdpLib();
   const cdp = await openTab(url, PORT);
   try {
-    await sleep(4500);
+    await humanPause(4000, 9000);
     const raw = await cdp.eval(`JSON.stringify({url:location.href,security:location.href.includes('security_check')||!!document.querySelector('.security-check,.verify-wrap,.captcha'),links:[...document.querySelectorAll('a[href*="/job_detail/"]')].map(a=>{const card=a.closest('li,.job-card-wrapper,.job-card-box,.job-list-box')||a.parentElement;return {url:a.href,title:(a.innerText||'').trim(),text:(card?.innerText||a.innerText||'').trim(),activityText:(card?.innerText||'').match(/(?:在线|刚刚活跃|今日活跃|今天活跃|三日内活跃|本周活跃|本月活跃|\\d+[天周月]内活跃)/)?.[0]||''}}).filter(x=>x.title)})`);
     const result = JSON.parse(raw || '{}');
     if (result.security) throwSecurity('搜索页进入安全验证', `${query} 第${page}页`);
     const unique = new Map((result.links || []).map(x => [jobIdOf(x.url), x]).filter(([id]) => id));
     if (!unique.size) throw new Error('搜索页没有可读取岗位，按空结果停止，不继续翻页');
-    const ledger = loadLedger();
     let fresh = 0;
     const counts = { priority: 0, review: 0, reject: 0 };
     for (const [id, link] of unique) {
@@ -880,12 +1033,12 @@ async function companyJobs() {
   const ledger = loadLedger();
   const company = ledger.companies.find(x => x.name === name);
   if (!company?.url) throw new Error(`公司池中没有 ${name} 或缺少入口链接`);
-  const { openTab, closeTab, sleep } = cdpLib();
+  const { openTab, closeTab } = cdpLib();
   const cdp = await openTab(company.url, PORT);
   try {
-    await sleep(4000);
+    await humanPause(3500, 7000);
     let allJobsUrl = await cdp.eval(`(()=>{const a=[...document.querySelectorAll('a')].find(x=>/查看(全部|所有)职位/.test((x.innerText||'').trim()));return a?.href||''})()`);
-    if (allJobsUrl) { await cdp.navigate(allJobsUrl); await sleep(3500); }
+    if (allJobsUrl) { await cdp.navigate(allJobsUrl); await humanPause(3000, 6500); }
     const raw = await cdp.eval(`JSON.stringify({url:location.href,security:location.href.includes('security_check')||!!document.querySelector('.security-check,.verify-wrap,.captcha'),links:[...document.querySelectorAll('a[href*="/job_detail/"]')].map(a=>({url:a.href,text:(a.innerText||'').trim()})).filter(x=>x.text)})`);
     const page = JSON.parse(raw || '{}');
     if (page.security) throwSecurity('公司职位页进入安全验证', name);
@@ -926,6 +1079,87 @@ function profiles() {
   }
 }
 
+function rateUsage(ledger) {
+  return Object.fromEntries(Object.keys(RATE_LIMITS).map(kind => {
+    const timestamps = recentTimestamps(ledger, kind);
+    const in24h = countWithin(timestamps, WINDOW_24H);
+    return [kind, {
+      in24h,
+      in10min: countWithin(timestamps, WINDOW_10MIN),
+      remainingUntilSoftLimit: Math.max(0, RATE_LIMITS[kind].softLimit24h - in24h),
+    }];
+  }));
+}
+
+function rateStatus() {
+  const ledger = loadLedger();
+  console.log(JSON.stringify({
+    lock: loadLock(), night: isNightHour(), paceMultiplier: paceMultiplier(),
+    consecutiveEmptyJd: ledger.safety?.consecutiveEmptyJd || 0,
+    used: rateUsage(ledger), limits: RATE_LIMITS,
+  }, null, 2));
+}
+
+// 开场自检合并成一条命令：原来要跑 self-test/validate/check/replies/interactions/list/rate-status
+// 七次，七份各自的样板输出和七轮工具调用开销，而其中绝大部分内容每次都一样。
+// 这里只输出"本轮真正要做决定所需"的信息：能不能跑、跑到哪了、有什么在等着处理。
+async function preflight() {
+  const ledger = loadLedger();
+  const lock = loadLock();
+  const blocked = lock.locked ? `锁定中：${lock.reason}（${lock.lockedAt}）` : '';
+
+  let browser = { ok: false, bossTabs: 0, securityPages: 0 };
+  if (!blocked) {
+    try {
+      const tabs = await fetch(`http://127.0.0.1:${PORT}/json`).then(r => r.json());
+      const boss = tabs.filter(x => x.type === 'page' && /zhipin\.com/.test(x.url || ''));
+      const security = boss.filter(x => matchSecurityPage(`${x.url} ${x.title}`));
+      browser = { ok: boss.length > 0 && security.length === 0, bossTabs: boss.length, securityPages: security.length };
+      if (security.length) {
+        writeLock('preflight 发现安全/异常页面', security.map(x => `${x.url} ${x.title}`).join(' ; '));
+        browser.note = '已写入熔断锁，所有在线命令拒绝运行';
+      }
+    } catch (error) {
+      browser.note = `CDP 端口 ${PORT} 不可达：${error.message}`;
+    }
+  }
+
+  const ready = ledger.jobs.filter(x =>
+    ['remote', 'pay', 'risk'].every(k => x.review?.[k]?.status === 'pass') &&
+    x.outreach?.status === 'not_sent' &&
+    !priorContactReason(ledger, x)
+  );
+  const needsReadReview = ledger.jobs.filter(x =>
+    x.jd?.status === 'read' && x.outreach?.status === 'not_sent' &&
+    !['remote', 'pay', 'risk'].every(k => x.review?.[k]?.status === 'pass') &&
+    !['remote', 'pay', 'risk'].some(k => x.review?.[k]?.status === 'fail')
+  );
+
+  console.log(JSON.stringify({
+    blocked: blocked || undefined,
+    browser,
+    rate: { night: isNightHour(), paceMultiplier: paceMultiplier(), used: rateUsage(ledger) },
+    consecutiveEmptyJd: ledger.safety?.consecutiveEmptyJd || 0,
+    ledger: {
+      jobs: ledger.jobs.length,
+      completeJd: ledger.jobs.filter(x => x.jd?.status === 'read').length,
+      delivered: ledger.jobs.filter(x => x.outreach?.status === 'delivered').length,
+      deliveryUnverified: ledger.jobs.filter(x => x.outreach?.status === 'delivery_unverified').map(x => x.jobId),
+    },
+    queue: {
+      readyToSend: ready.length,
+      readyToSendIds: ready.slice(0, 20).map(x => x.jobId),
+      awaitingReview: needsReadReview.length,
+      awaitingReviewIds: needsReadReview.slice(0, 20).map(x => x.jobId),
+    },
+    conversations: {
+      needsReply: ledger.conversations.filter(x => x.status === 'needs_reply').length,
+      needsJudgement: ledger.conversations.filter(x => x.status === 'boss_last_review').length,
+    },
+  }, null, 2));
+  if (blocked || !browser.ok) process.exitCode = 2;
+}
+
 function candidates() {
   const ledger = loadLedger();
   const limit = Math.min(100, Number(arg('limit') || 30));
@@ -961,10 +1195,12 @@ async function sendMessage(url, message) {
     return;
   }
 
-  const { openTab, closeTab, sleep } = cdpLib();
+  // 静态去重命中时不联网、不占速率闸门；真要发才计入 sends
+  await guardRate('sends', ledger);
+  const { openTab, closeTab } = cdpLib();
   const cdp = await openTab(url, PORT);
   try {
-    await sleep(5000);
+    await humanPause(5000, 10000);
     const preflight = JSON.parse(await cdp.eval(jobPageExpression()) || '{}');
     if (preflight.security) throwSecurity('发送前岗位页进入安全验证', `${id} ${job.url}`);
     if (isClosedJobText(preflight.bodyText)) {
@@ -976,6 +1212,9 @@ async function sendMessage(url, message) {
       return;
     }
     if (jobIdOf(preflight.url) !== id || !preflight.button?.text) throw new Error('发送前岗位页或沟通按钮核验失败');
+    // 发送前会重新加载一次详情页，BOSS 那边照样算一次详情页浏览；
+    // 只记 sends 而不记这次浏览，会让 jobReads 的 24 小时总量算少。
+    job.jd.liveCheckedAt = now();
     const actual = normalizeStructuredPage(preflight);
     if (actual.structured.incomplete) throw new Error('发送前 JD 变为不完整，已停止');
     if (job.jd.hash && actual.hash !== job.jd.hash) throw new Error('JD 自上次审核后已变化，请重新 read 和 review');
@@ -996,12 +1235,12 @@ async function sendMessage(url, message) {
     // 轮询等待聊天页就绪：不再用固定 sleep，避免偶发加载慢 / 弹窗延后注入导致 chat-not-ready。
     let chatReady = false;
     for (let i = 0; i < 25; i++) {
-      await sleep(1000);
+      await humanPause(800, 1400);
       // 每次轮询都尝试关闭“号码隐私保护/安全风险”安全弹窗（可能多次注入）
       await cdp.eval(`(function(){const cancel=[...document.querySelectorAll('button,a,span')].find(x=>{const t=(x.innerText||'').trim();return t==='取消'&&/隐私保护|安全风险/.test(document.body.innerText);});if(cancel){cancel.click();return 'closed';}return 'none';})()`);
 
       const dismissedResumeNotice = await cdp.eval(`(function(){const body=document.body.innerText||'';if(!/完善在线简历|请先完善(在线)?简历|简历不完整|去完善简历|完善简历后/.test(body))return false;const ok=[...document.querySelectorAll('button,a,span')].find(x=>x.offsetParent&&(x.innerText||'').trim()==='好的');if(!ok)return false;ok.click();return true;})()`);
-      if (dismissedResumeNotice) { await sleep(300); continue; }
+      if (dismissedResumeNotice) { await humanPause(300, 700); continue; }
 
       const probe = await cdp.eval(`(function(){try{return {input:!!document.querySelector('#chat-input'),chat:location.href.includes('/web/geek/chat'),text:document.body.innerText};}catch(e){return {input:false,chat:false,text:''};}})()`);
       if (probe && probe.input && probe.chat) { chatReady = true; break; }
@@ -1028,9 +1267,9 @@ async function sendMessage(url, message) {
         console.log(`BLOCKED (${block}) ${id} ${job.title} @ ${job.company}`);
         return;
       }
-      throw new Error('chat-not-ready: 点击沟通后 25s 内聊天页未就绪');
+      throw new Error('chat-not-ready: 点击沟通后 25 轮轮询内聊天页未就绪');
     }
-    await sleep(500);
+    await humanPause(400, 900);
     const sent = await cdp.eval(`(async()=>{
       const hasDialog = [...document.querySelectorAll('button,a,span')].some(x => /已沟通过|沟通新职位/.test(x.innerText || ''));
       if (hasDialog) {
@@ -1110,7 +1349,7 @@ function showOpenerContext() {
   if (!job) throw new Error(`台账中没有岗位 ${id}`);
   ledger.jobs[index] = job;
   assertAgentReady(ledger, job);
-  console.log(JSON.stringify(openerContext(job, arg('profile')), null, 2));
+  console.log(JSON.stringify(openerContext(job, arg('profile'), process.argv.includes('--brief')), null, 2));
 }
 
 function saveOpener() {
@@ -1167,10 +1406,10 @@ async function verifyDelivery() {
   const job = ledger.jobs.find(x => x.jobId === id);
   if (!job) throw new Error(`台账中没有岗位 ${id}`);
   if (job.outreach?.status !== 'delivery_unverified' && job.outreach?.status !== 'delivered') throw new Error(`岗位状态为 ${job.outreach?.status}，不能执行送达补录核验`);
-  const { openTab, closeTab, sleep } = cdpLib();
+  const { openTab, closeTab } = cdpLib();
   const cdp = await openTab(`https://www.zhipin.com/web/geek/chat`, PORT);
   try {
-    await sleep(4000);
+    await humanPause(3500, 7000);
     const raw = await cdp.eval(`(()=>{
       const list = [...document.querySelectorAll('.friend-list-item')];
       const match = list.find(x => (x.innerText||'').includes(${JSON.stringify(job.company)}));
@@ -1179,7 +1418,7 @@ async function verifyDelivery() {
       return { ok: true };
     })()`);
     if (raw?.error) throw new Error(raw.error);
-    await sleep(2000);
+    await humanPause(1600, 2800);
     const msg = job.outreach.message;
     const sent = await cdp.eval(`(async()=>{
       const msg=${JSON.stringify(msg)};
@@ -1201,7 +1440,7 @@ async function verifyDelivery() {
   }
 }
 
-function selfTest() {
+async function selfTest() {
   PREFERENCES.opener = { ...PREFERENCES.opener, bannedClaims: ['多年经验'] };
   PROFILES['test_mock'] = { label: 'Test', titleKeywords: ['TestTitle'], jdKeywords: ['TestJD'] };
   const firstProfileId = 'test_mock';
@@ -1218,10 +1457,91 @@ function selfTest() {
   assert.equal(matchSecurityPage('正常'), false);
   assert.match(unreadableJobMessage({bodyText: '登录查看完整内容'}), /登录态失效/);
   assert.match(unreadableJobMessage({bodyText: '正常'}), /JD 正文在 12 秒内未渲染/);
-  const todayStr = new Date().toISOString().slice(0, 10);
-  const testLimitLedger = { jobs: Array.from({ length: 950 }, (_, i) => ({ jobId: `j${i}`, jd: { checkedAt: `${todayStr}T10:00:00.000Z` } })) };
-  assert.equal(dailyReadCount(testLimitLedger), 950);
-  assert.throws(() => assertDailyReadLimit(testLimitLedger), /每日岗位详情页读取量已达上限/);
+
+  // ── 24 小时滚动速率闸门 ──
+  const stamp = minutesAgo => new Date(Date.now() - minutesAgo * 60000).toISOString();
+  const ledgerWithReads = n => ({ jobs: Array.from({ length: n }, (_, i) => ({ jobId: `j${i}`, jd: { checkedAt: stamp(60 + i) } })) });
+
+  // 25 小时前的读取必须滑出 24 小时窗口，不能一直累加
+  const rolled = ledgerWithReads(3);
+  rolled.jobs.push({ jobId: 'old', jd: { checkedAt: stamp(25 * 60) } });
+  assert.equal(countWithin(recentTimestamps(rolled, 'jobReads'), WINDOW_24H), 3);
+
+  // 旧版按自然日归零的漏洞回归：昨晚 23:00 和今天 00:30 只隔 90 分钟，必须算进同一个窗口
+  const acrossMidnight = { jobs: [{ jobId: 'a', outreach: { sentAt: stamp(90) } }, { jobId: 'b', outreach: { sentAt: stamp(30) } }] };
+  assert.equal(countWithin(recentTimestamps(acrossMidnight, 'sends'), WINDOW_24H), 2);
+
+  // 24 小时软上限用完 → 拒绝（不写熔断锁，只是等窗口滑出）
+  await assert.rejects(() => guardRate('searchPages', { runs: Array.from({ length: RATE_LIMITS.searchPages.softLimit24h }, (_, i) => ({ type: 'search', at: stamp(60 + i) })) }), /24 小时滚动额度已用完/);
+
+  // 10 分钟突发上限 → 拒绝（总量远没到 24 小时上限，纯粹是密度太高）
+  const burstLedger = { jobs: Array.from({ length: RATE_LIMITS.jobReads.burstLimit10min }, (_, i) => ({ jobId: `b${i}`, jd: { checkedAt: stamp(i * 0.1) } })) };
+  await assert.rejects(() => guardRate('jobReads', burstLedger), /10 分钟突发上限/);
+
+  // 24 小时硬顶 → 写入熔断锁（用临时锁文件，不能碰真实 data/lock.json）
+  const tmpLockFile = path.join(os.tmpdir(), `bossmate-selftest-lock-${process.pid}.json`);
+  const overCeiling = { jobs: Array.from({ length: RATE_LIMITS.jobReads.hardCeiling24h }, (_, i) => ({ jobId: `c${i}`, jd: { checkedAt: stamp(i * 0.01) } })) };
+  await assert.rejects(() => guardRate('jobReads', overCeiling, { lockFile: tmpLockFile }), /触到平台硬顶/);
+  assert.equal(loadLock(tmpLockFile).locked, true);
+  fs.rmSync(tmpLockFile, { force: true });
+
+  // 间隔不够只等待、不报错：临时把间隔调小以免拖慢自测，验证真的会等待而不是直接放行或抛错
+  const originalGap = RATE_LIMITS.jobReads.minGapMs;
+  RATE_LIMITS.jobReads.minGapMs = 50;
+  const justNow = { jobs: [{ jobId: 'z', jd: { checkedAt: new Date().toISOString() } }] };
+  const startedAt = Date.now();
+  await guardRate('jobReads', justNow);
+  assert(Date.now() - startedAt >= 20, '间隔不足时必须实际等待，不能直接放行');
+  RATE_LIMITS.jobReads.minGapMs = originalGap;
+
+  // 深夜只压节奏、不压总量
+  assert.equal(isNightHour(new Date(2026, 0, 1, 23, 30)), true);
+  assert.equal(isNightHour(new Date(2026, 0, 1, 3, 0)), true);
+  assert.equal(isNightHour(new Date(2026, 0, 1, 14, 0)), false);
+  assert.equal(paceMultiplier(new Date(2026, 0, 1, 23, 30)), NIGHT_PACE);
+  assert.equal(paceMultiplier(new Date(2026, 0, 1, 14, 0)), 1);
+
+  // 随机抖动：连续抽样不能全一样，否则又退化成固定间隔
+  assert.equal(new Set(Array.from({ length: 20 }, () => rndInt(3000, 6500))).size > 1, true);
+
+  // ── 审核载荷与上下文瘦身 ──
+  const payloadJob = blankJob('payload');
+  payloadJob.title = '岗位标题';
+  payloadJob.company = '某公司';
+  payloadJob.recruiter = { activeText: '今日活跃' };
+  payloadJob.jd = {
+    status: 'read', remoteHint: '支持远程', hash: 'h',
+    structured: { description: '岗位正文内容', experience: '1-3年', education: '本科', salary: '20-30K', benefits: '远程', incomplete: false },
+  };
+  const payload = reviewPayload(payloadJob);
+  // 审岗所需字段必须一次给全，否则 agent 只能回去读台账
+  for (const field of ['description', 'remoteHint', 'salary', 'experience', 'education', 'recruiterActive', 'review', 'outreachStatus']) {
+    assert(field in payload, `reviewPayload 缺少审核所需字段 ${field}`);
+  }
+  assert.equal(payload.description, '岗位正文内容');
+  assert.deepEqual(payload.review, { remote: 'pending', pay: 'pending', risk: 'pending' });
+
+  // --brief 必须去掉重复的 JD 正文和事实档案，且不能因此丢掉写开场白必需的字段
+  PROFILES['brief_mock'] = { label: 'Brief', titleKeywords: ['岗位标题'], jdKeywords: [], factFocus: '选最相关的一项' };
+  const fullCtx = buildOpenerContext(payloadJob, 'brief_mock', false);
+  const briefCtx = buildOpenerContext(payloadJob, 'brief_mock', true);
+  assert.equal('userProfile' in fullCtx, true);
+  assert.equal('description' in fullCtx.job, true);
+  assert.equal('userProfile' in briefCtx, false, '--brief 不应重发事实档案');
+  assert.equal('description' in briefCtx.job, false, '--brief 不应重发 JD 正文');
+  assert.equal(briefCtx.userProfileSource, rel(FACTS_FILE));
+  for (const field of ['jobId', 'title', 'company', 'salary']) assert(field in briefCtx.job);
+  assert.equal(briefCtx.profile.factFocus, '选最相关的一项');
+  assert(JSON.stringify(briefCtx).length < JSON.stringify(fullCtx).length, '--brief 必须更小');
+  delete PROFILES['brief_mock'];
+
+  // 风控级熔断当天不得解锁；普通异常和超过 24 小时的旧锁可以正常解
+  const severeLock = { locked: true, reason: '访问受限：账户存在异常行为', evidence: '', lockedAt: new Date().toISOString() };
+  assert.match(unlockRefusal(severeLock), /当天不得解锁/);
+  assert.equal(unlockRefusal({ ...severeLock, lockedAt: new Date(Date.now() - 3 * WINDOW_24H).toISOString() }), '');
+  assert.equal(unlockRefusal({ locked: true, reason: 'check 发现安全/异常页面', lockedAt: new Date().toISOString() }), '');
+  assert.equal(unlockRefusal({ locked: false }), '');
+
   assert.equal(conversationStatus({ lastMessage: '暂时不考虑远程亲' }), 'closed');
   assert.equal(conversationStatus({ lastMessage: '可以先看下样片嘛' }), 'needs_reply');
   assert.deepEqual(sentVerification({ inputEmpty: true, exactMessageCount: 1, sameRowStatusClass: 'message-status status-delivery', companyVisible: true }), { inputEmpty: true, exactMessage: true, sameRowDelivered: true, companyVisible: true });
@@ -1265,17 +1585,21 @@ function selfTest() {
 }
 
 const commands = {
-  import: importLegacy, validate, check, replies, interactions, profile, profiles, search, candidates,
-  read: readJob, review, 'opener-context': showOpenerContext, 'save-opener': saveOpener, send,
-  company, 'company-jobs': companyJobs, list, 'self-test': selfTest, unlock, 'verify-delivery': verifyDelivery
+  import: importLegacy, validate, check, preflight, replies, interactions, profile, profiles, search, candidates,
+  read: readJob, jd: showJd, review, 'opener-context': showOpenerContext, 'save-opener': saveOpener, send,
+  company, 'company-jobs': companyJobs, list, 'self-test': selfTest, unlock, 'verify-delivery': verifyDelivery,
+  'rate-status': rateStatus,
 };
 const command = process.argv[2];
 if (!commands[command]) {
-  console.log('用法: node scripts/boss.js <check|replies|interactions|profile|profiles|search|candidates|read|review|opener-context|save-opener|send|verify-delivery|company|company-jobs|list|import|validate|self-test|unlock>');
+  console.log('用法: node scripts/boss.js <preflight|check|replies|interactions|profile|profiles|search|candidates|read|jd|review|opener-context|save-opener|send|verify-delivery|company|company-jobs|list|rate-status|import|validate|self-test|unlock>');
   process.exit(command ? 1 : 0);
 }
 if (['check', 'replies', 'interactions', 'profile', 'search', 'read', 'review', 'opener-context', 'save-opener', 'send', 'verify-delivery', 'company', 'company-jobs'].includes(command)) {
   assertConfigured();
   assertNotLocked();
 }
+// preflight 自己就要负责报告"是否被锁"，所以不能被锁挡在门外；
+// jd 是纯离线复看，上下文被压缩后正需要它在锁定期间也能取回正文。
+if (['preflight', 'jd'].includes(command)) assertConfigured();
 Promise.resolve(commands[command]()).catch(error => { console.error(`ERROR: ${error.message}`); process.exit(1); });

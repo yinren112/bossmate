@@ -22,6 +22,7 @@ Never store resumes, browser profiles, chats, or the live ledger inside this Ski
 2. If the dedicated browser is missing or logged out, read [references/browser.md](references/browser.md).
 3. For job-search execution, read [references/workflow.md](references/workflow.md).
 4. Before any online or send action, apply [references/safety.md](references/safety.md).
+5. Only when changing a rate limit, adding an online action, or judging whether some pacing behavior is a bug, read [references/rate-limit-rationale.md](references/rate-limit-rationale.md). Do not load it for routine runs.
 
 ## Non-negotiable rules
 
@@ -34,7 +35,10 @@ Never store resumes, browser profiles, chats, or the live ledger inside this Ski
 - Use only facts the user confirmed in `profile.md`.
 - Never reset or bypass an outreach state. The runtime intentionally has no force-send option.
 - Count a send only when the exact message is bound to the user's message row and that row shows delivered/read.
-- Stop immediately and write persistent circuit breaker lock (`lock.json`) on security verification pages, 403, passport exception pages, account anomalies, code 32/36/37, consecutive blank JDs (≥3 times), uncertain recipient identity, or uncertain delivery. All online commands refuse to run while `lock.json` exists until manually unlocked via `unlock --reason=<explanation>`.
+- Stop immediately and write persistent circuit breaker lock (`lock.json`) on security verification pages, 403, passport exception pages, account anomalies, code 32/36/37, consecutive blank JDs (≥3 times), a rolling-window rate-limit hard ceiling, uncertain recipient identity, or uncertain delivery. All online commands refuse to run while `lock.json` exists until manually unlocked via `unlock --reason=<explanation>`; platform-level signals (code 32/36/37, access-restricted) additionally refuse to unlock the same day unless overridden with `--override-severe-lock`.
+- Rate-limit `search`, `read`, and `send` against a 24-hour rolling window (not a calendar day), with a 10-minute burst cap and a randomized minimum gap between actions; see [references/safety.md](references/safety.md) for the exact numbers and rationale. Never replace a randomized wait with a fixed one.
+- **Never read `data/ledger.json` directly.** It holds ~5 KB per job and will swamp the context. Use commands for every field: `read --jd` / `jd` (JD text and review input), `preflight` (run state), `list` / `candidates` (queues), `rate-status` (limits).
+- Read each JD once, record the verdict via `review`, then drop it from working context. Load `profile.md` once per session and pass `--brief` to `opener-context` thereafter. Work in batches of ~15–20 jobs per session.
 
 ## Agent responsibilities
 
