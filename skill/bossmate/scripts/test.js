@@ -88,6 +88,15 @@ try {
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /SELF_TEST_OK/);
 
+  // jd：离线取回审核所需的全部字段（含正文），让 agent 永远不必去读 ledger.json
+  result = run('boss.js', ['jd', 'fixture-job']);
+  assert.equal(result.status, 0, result.stderr);
+  const jdPayload = JSON.parse(result.stdout);
+  assert.equal(jdPayload.description, '负责软件开发、测试和交付，支持远程办公。');
+  for (const field of ['salary', 'remoteHint', 'review', 'outreachStatus']) {
+    assert(field in jdPayload, `jd 输出缺少审核所需字段 ${field}`);
+  }
+
   result = run('boss.js', [
     'review', 'fixture-job',
     '--remote=pass', '--remote-evidence=支持远程办公',
@@ -99,6 +108,17 @@ try {
   result = run('boss.js', ['opener-context', 'fixture-job']);
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Built and shipped one real software project/);
+  const fullContextSize = result.stdout.length;
+
+  // --brief 去掉重复的事实档案和 JD 正文，但保留写开场白必需的字段
+  result = run('boss.js', ['opener-context', 'fixture-job', '--brief']);
+  assert.equal(result.status, 0, result.stderr);
+  assert(!/Built and shipped one real software project/.test(result.stdout), '--brief must not resend the fact profile');
+  assert(!/负责软件开发、测试和交付/.test(result.stdout), '--brief must not resend the JD body');
+  assert(result.stdout.length < fullContextSize, '--brief must be smaller than the full context');
+  const briefContext = JSON.parse(result.stdout);
+  assert.equal(briefContext.job.jobId, 'fixture-job');
+  assert(briefContext.openerRules, '--brief must still carry opener rules');
 
   const message = '我独立交付过一个真实软件项目，想了解这个岗位目前最希望优先解决哪类开发问题？';
   result = run('boss.js', ['save-opener', 'fixture-job'], { MSG: message });
@@ -108,6 +128,13 @@ try {
   result = run('boss.js', ['validate']);
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /VALID/);
+
+  // preflight 汇总本轮所需状态；即使浏览器不可达（CI 环境）也必须给出可解析的报告而不是崩掉
+  result = run('boss.js', ['preflight']);
+  const preflightReport = JSON.parse(result.stdout);
+  assert(preflightReport.rate, 'preflight must report rate-limit state');
+  assert(preflightReport.queue, 'preflight must report the work queue');
+  assert.equal(typeof preflightReport.ledger.jobs, 'number');
 
   const source = fs.readFileSync(path.join(__dirname, 'boss.js'), 'utf8');
   assert(!source.includes('--force'), 'force-send option must not exist');
