@@ -1,5 +1,45 @@
 # Safety and privacy
 
+## Rolling rate limits
+
+All limits are evaluated over a **rolling 24-hour window**, not a calendar day. Counters derive
+from timestamps already in the ledger — there is no separate counter file and no in-memory counter.
+
+| Gate | Search pages | Job-detail reads | Sends |
+|---|---|---|---|
+| 24h soft limit (normal stopping point) | 30 | 300 | 30 |
+| 24h hard ceiling (auto-triggers the circuit breaker) | 120 | 900 | 150 |
+| 10-minute burst limit | 6 | 40 | 6 |
+| Minimum gap between actions | 15s | 8s | 25s |
+
+Behavior when a gate is hit:
+
+- **24h soft limit or 10-minute burst limit** → run stops with an error. Wait for the window to slide.
+- **24h hard ceiling** → run stops *and* writes the circuit breaker lock. At that volume the traffic itself is the anomaly.
+- **Minimum gap not met** → not an error. The runtime waits out the remainder with jitter and continues. `[节流] ...` lines are this, working as intended.
+
+Treat the hard ceiling as a fuse, not a target. Day-to-day operation should sit well under the
+soft limit; raise a soft limit only after several clean days on an account with no restriction
+history. `send` also charges the read quota, because its preflight loads a job detail page.
+
+Between **23:00 and 09:00** local time the minimum gap doubles and the burst limit is halved. The
+24-hour totals are unchanged — late-night traffic is spread out, not blocked.
+
+Never replace a randomized wait with a fixed one. For the reasoning behind any of the above —
+including why a calendar-day counter and fixed intervals both fail — see
+[rate-limit-rationale.md](rate-limit-rationale.md).
+
+## Context hygiene
+
+The ledger grows to roughly 5 KB per job, so a few hundred jobs is already large enough to
+overwhelm an agent's context in a single read.
+
+- **Never read `data/ledger.json` directly.** Every field an agent needs is available through a command: `read --jd` / `jd` for review input, `preflight` for run state, `list` and `candidates` for queues, `rate-status` for limits.
+- Get the JD once per job via `read <id> --jd`, judge it, record the verdict with `review`, then let it go. Once the evidence is in the ledger the JD text has no further use — do not carry a backlog of full JDs forward.
+- Use `opener-context --brief` after the first job in a session: it omits the JD you just read and the fact profile that has not changed, which is most of the payload.
+- Load `profile.md` once per session, not per job.
+- Process one job to completion before starting the next, and work in batches of roughly 15–20 jobs per session. Safety state (lock, rate counters, ledger) is all on disk and survives compaction, but the reasoning behind skip/reject decisions does not — a fresh session beats a compacted one.
+
 ## Hard stops and circuit breaker lock
 
 Stop all online actions for the affected account immediately when any of these conditions occur:
@@ -7,7 +47,7 @@ Stop all online actions for the affected account immediately when any of these c
 - HTTP 403, passport exception page, CAPTCHA, security verification, or account anomaly;
 - API error code 32, 36, or 37;
 - consecutive blank or partial JD content (≥3 times);
-- daily job detail page read limit reached (max 950 reads per calendar day);
+- a rolling rate-limit hard ceiling above is reached;
 - job, company, recruiter, or recipient mismatch;
 - uncertain message delivery;
 - unexpected browser navigation or lost login.
@@ -16,7 +56,9 @@ Do not retry through a different browser surface, account, internal API, or auto
 
 ### Persistent Circuit Breaker Lock (`lock.json`)
 
-When a hard stop condition (such as security verification, 403, passport exception, code 32/36/37, or 3 consecutive blank JDs) is detected, the runtime automatically writes a persistent circuit breaker lock file (`data/lock.json`).
+When a hard stop condition (such as security verification, 403, passport exception, code 32/36/37,
+3 consecutive blank JDs, or a rate-limit hard ceiling) is detected, the runtime automatically
+writes a persistent circuit breaker lock file (`data/lock.json`).
 
 While `lock.json` exists:
 - All online commands (`check`, `replies`, `interactions`, `search`, `candidates`, `read`, `send`, `verify-delivery`, `company-jobs`, etc.) will immediately refuse to run.
@@ -28,6 +70,20 @@ The circuit breaker lock can ONLY be removed through explicit human manual inter
 
 ```powershell
 node scripts/boss.js unlock --reason="<explanation of resolution and manual verification>"
+```
+
+**Platform-level signals do not unlock the same day.** If the lock reason indicates the platform's
+own anti-abuse system fired — code 32/36/37, "access restricted," "account anomaly detected" —
+`unlock` refuses until 24 hours have passed *and* the calendar day has changed, and reports the
+earliest time it will allow it. This exists because the common failure pattern in real incidents
+is not the request that trips the signal — it's continuing to browse a few more times right after
+the signal appears, which is what turns a throttled endpoint into a full account restriction.
+Ordinary hard stops (e.g. a stray security page `check` happened to notice) are not subject to
+this and can be unlocked any time. Overriding the cooldown before it expires requires an explicit
+`--override-severe-lock` flag and is the operator's own call to make, not the runtime's default:
+
+```powershell
+node scripts/boss.js unlock --reason="<explanation>" --override-severe-lock
 ```
 
 After unlocking, perform a single human-supervised minimal check (`node scripts/boss.js check` and `read` one job) before resuming automated runs.
