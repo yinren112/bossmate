@@ -38,6 +38,7 @@ Update `<home>/preferences.json`:
 - use real title/JD keywords supplied or confirmed by the user;
 - set city, browser, compensation, exclusions, and opener limits;
 - add risky or unsupported claims to `opener.bannedClaims`;
+- 将用户实际可用的附件简历文件名写入 `resumes.files`，并在 `resumes.profileMapping` 中配置岗位方向到简历文件名的映射；没有真实附件时保持为空；
 - set `onboarding.confirmed` to `true` only after the user confirms the summary;
 - record `confirmedAt` as an ISO timestamp.
 

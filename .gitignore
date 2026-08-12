@@ -1,4 +1,6 @@
 node_modules/
 *.tgz
+output/
+tasks/
 .DS_Store
 Thumbs.db

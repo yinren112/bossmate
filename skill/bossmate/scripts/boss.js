@@ -1,219 +1,52 @@
 #!/usr/bin/env node
 const assert = require('assert');
-const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const DEFAULT_HOME = path.join(process.env.USERPROFILE || process.env.HOME || process.cwd(), '.bossmate');
-const ROOT = path.resolve(process.env.BOSSMATE_HOME || process.env.BOSS_JOB_HOME || DEFAULT_HOME);
-const ARCHIVE = path.join(ROOT, 'archive');
-const DATA_DIR = path.join(ROOT, 'data');
-const LEDGER_FILE = path.join(DATA_DIR, 'ledger.json');
-const FACTS_FILE = path.join(ROOT, 'profile.md');
-const PREFERENCES_FILE = path.join(ROOT, 'preferences.json');
-const PREFERENCES = fs.existsSync(PREFERENCES_FILE)
-  ? JSON.parse(fs.readFileSync(PREFERENCES_FILE, 'utf8'))
-  : {};
-const PROFILES = PREFERENCES.profiles || {};
-const PORT = Number(process.env.BOSS_CDP_PORT || PREFERENCES.browser?.port || 9222);
-const CITY_CODE = String(PREFERENCES.search?.cityCode || '100010000');
-const MIN_HOURLY_PAY = Number(PREFERENCES.requirements?.minimumHourlyPay || 0);
-const CDP_LIB = './cdp';
-let cachedCdp;
+const {
+  ROOT, DATA_DIR, LEDGER_FILE, FACTS_FILE, PREFERENCES_FILE,
+  PREFERENCES, PROFILES, PORT, CITY_CODE, MIN_HOURLY_PAY, REVIEW_FIELDS,
+  now, rel,
+} = require('./runtime-config');
+const { arg, positional, hasFlag, jobIdOf, isRealJobUrl } = require('./cli-args');
+const { loadLedger, saveLedger } = require('./ledger-store');
+const {
+  blankJob, normalizeJob, addDecision, activityRank, includesKeyword, matchProfile,
+  parseSearchCard, preScreenJob, recruiterFromButton, conversationKey,
+  priorContactReason, ensureJob, assessRemote,
+} = require('./job-domain');
+const {
+  parseJobBody, jdHashOf, normalizeStructuredPage,
+  assertReadableDescription, hydrateLegacyStructured,
+} = require('./jd-domain');
+const {
+  validateOpener, assertSendReady, assertAgentReady, reviewPayload, showJd,
+  detectSendBlock, buildOpenerContext, openerContext,
+} = require('./opener-service');
+const { verifyFrom, buildDeliveryVerifyExpr, sentVerification } = require('./delivery-verification');
+const { conversationStatus, resumeTrigger } = require('./conversation-domain');
+const { loadDailyOptions } = require('./daily-options');
+const { HELP, help } = require('./command-help');
+const {
+  rehashJd, profiles, rateUsage, rateStatus, dailyOptions, jobWorkbench, nextWork,
+  reviewAudit, showOpenerContext, saveOpener, discardOpener, review, company,
+} = require('./offline-commands');
+const {
+  search, searchNext, searchClose, favorites, favoritesNext, favoriteStatus, favoriteQueue, recommendations,
+  recommendationsNext, recommendationsClose, jobSources,
+} = require('./discovery-sources');
+const { migrateJd, importLegacy, validate } = require('./maintenance');
+const { isClosedJobText, unreadableJobMessage, isExpiredJobRedirect, jobPageExpression } = require('./page-flows');
+const {
+  LOCK_FILE, BUDGET_FILE, SECURITY_JS_EXPR, ONLINE_COMMANDS, RATE_LIMITS,
+  WINDOW_24H, WINDOW_10MIN, NIGHT_PACE, rndInt, humanPause, isNightHour,
+  paceMultiplier, matchSecurityPage, loadLock, writeLock, assertNotLocked, throwSecurity,
+  unlockRefusal, unlock, loadBudget, saveBudget, budgetCountWithin, reserveAction,
+  noteEmptyJd, resetEmptyJd,
+} = require('./safety');
+const cdpLib = () => require('./cdp');
 
-function cdpLib() {
-  if (cachedCdp) return cachedCdp;
-  cachedCdp = require(CDP_LIB);
-  cachedCdp.CDP.prototype.eval = async function evalWithClearedTimeout(expr, timeoutMs = 25000) {
-    let timer;
-    try {
-      const command = this._cmd('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true });
-      const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('CDP eval timeout')), timeoutMs); });
-      const message = await Promise.race([command, timeout]);
-      if (message.result?.exceptionDetails) throw new Error('JS 异常: ' + JSON.stringify(message.result.exceptionDetails).slice(0, 300));
-      return message.result?.result?.value;
-    } finally {
-      clearTimeout(timer);
-    }
-  };
-  return cachedCdp;
-}
-
-// ── 拟人节奏：所有等待都用随机区间，不用固定常数 ──
-// 固定间隔的等待是脚本化访问最容易被识别的特征之一——真人不会连续两次停顿完全相同的毫秒数。
-const sleepMs = ms => new Promise(resolve => setTimeout(resolve, Math.max(0, ms)));
-const rndInt = (lo, hi) => lo + Math.floor(Math.random() * (Math.max(hi, lo) - lo + 1));
-const humanPause = (lo, hi) => sleepMs(rndInt(lo, hi));
-
-const WINDOW_24H = 24 * 60 * 60 * 1000;
-const WINDOW_10MIN = 10 * 60 * 1000;
-// 深夜时段自动减速而不是禁止：既降低连续高强度访问的风险特征，也不强行打断用户自己的作息。
-const NIGHT_START_HOUR = 23; // 23:00
-const NIGHT_END_HOUR = 9;    // 09:00
-const NIGHT_PACE = 2;        // 深夜最小间隔翻倍、突发上限减半；24 小时总额度不变
-const isNightHour = (date = new Date()) => { const h = date.getHours(); return h >= NIGHT_START_HOUR || h < NIGHT_END_HOUR; };
-const paceMultiplier = (date = new Date()) => (isNightHour(date) ? NIGHT_PACE : 1);
-
-// ── 账号级熔断锁与安全检测 ──
-const LOCK_FILE = path.join(DATA_DIR, 'lock.json');
-const SECURITY_PAGE_RE = /security_check|captcha|verify|\/403\.html|[?&]code=(32|36|37)(?:&|$)|\/web\/passport\/|账户存在异常行为|暂时限制访问|访问受限/i;
-// 这些信号代表平台自己的风控已经判定过一次，而不是普通的加载失败或页面异常；
-// 出现后当天继续访问正是多起真实受限事件里共同的失败路径（信号出现后又继续访问几次，随后升级为账号级限制）。
-const SEVERE_LOCK_RE = /code=(?:32|36|37)|访问受限|账户存在异常|暂时限制访问|环境存在异常/;
-const ONLINE_COMMANDS = new Set(['check', 'replies', 'interactions', 'profile', 'search', 'read', 'opener-context', 'save-opener', 'send', 'verify-delivery', 'company-jobs']);
-const MAX_CONSECUTIVE_EMPTY_JD = 3;
-const JD_GARBAGE_RE = /微信扫码登录|扫码登录|请先登录|登录后查看|登录查看完整内容|手机验证码登录|密码登录/;
-
-// ── 24 小时滚动速率闸门 ──
-// 真实受限案例里，详情页阅读量在同一账号单日约 1000 次左右就会触发访问限制，
-// 而对照的低量账号（几百次/日）当天没有异常；发送侧观察到的量级在 150 上下。
-// 下面的 hardCeiling24h 是留出安全余量后的保险丝，不是"可以放心用满"的目标值；
-// 日常运行应该长期停在 softLimit24h 以下，只有账号观察稳定几天后再考虑上调。
-// 三层闸门里，总量（24h）和密度（10min）超限会直接拒绝；只有"两次动作间隔不够"
-// 会自动等待补足，不会报错——间隔问题是节奏问题，不是异常，不该让脚本直接失败。
-const RATE_LIMITS = {
-  searchPages: { softLimit24h: 30, hardCeiling24h: 120, burstLimit10min: 6, minGapMs: 15000 },
-  jobReads: { softLimit24h: 300, hardCeiling24h: 900, burstLimit10min: 40, minGapMs: 8000 },
-  sends: { softLimit24h: 30, hardCeiling24h: 150, burstLimit10min: 6, minGapMs: 25000 },
-};
-
-// 速率计数直接从台账里已有的时间戳派生（详情页 jd.checkedAt/liveCheckedAt、发送 outreach.sentAt、
-// 搜索 runs[].at），不另开一份计数文件：不会和台账的真实历史脱节，也天然扛得住进程重启、
-// 上下文压缩——每次命令都是独立进程，一个内存变量式的计数器在这里等于形同虚设。
-function recentTimestamps(ledger, kind) {
-  if (kind === 'jobReads') return (ledger.jobs || []).flatMap(j => [j.jd?.checkedAt, j.jd?.liveCheckedAt]).filter(Boolean);
-  if (kind === 'searchPages') return (ledger.runs || []).filter(r => r.type === 'search').map(r => r.at).filter(Boolean);
-  if (kind === 'sends') return (ledger.jobs || []).map(j => j.outreach?.sentAt).filter(Boolean);
-  return [];
-}
-
-function countWithin(timestamps, windowMs, at = Date.now()) {
-  const floor = at - windowMs;
-  return timestamps.filter(t => (Date.parse(t) || 0) >= floor).length;
-}
-
-// 三层闸门：24 小时总量（软上限拒绝，硬上限直接写熔断锁）、10 分钟突发密度、
-// 与上一次同类动作的最小间隔。注意窗口是滚动的，不按自然日归零——
-// 昨晚 23 点和今天 0 点半的动作只隔 90 分钟，必须算进同一个窗口，
-// 不能因为跨了零点就各自重新计数到独立的"两天配额"。
-async function guardRate(kind, ledger, { lockFile = LOCK_FILE } = {}) {
-  const limits = RATE_LIMITS[kind];
-  if (!limits) return;
-  const timestamps = recentTimestamps(ledger, kind);
-  const pace = paceMultiplier();
-  const used24h = countWithin(timestamps, WINDOW_24H);
-  if (used24h >= limits.hardCeiling24h) {
-    throwSecurity(`${kind} 触到平台硬顶：24 小时内已 ${used24h}/${limits.hardCeiling24h}`, 'hard-ceiling', lockFile);
-  }
-  if (used24h >= limits.softLimit24h) {
-    throw new Error(`24 小时滚动额度已用完：${kind} ${used24h}/${limits.softLimit24h}，等窗口滑出再继续；不为凑数继续访问`);
-  }
-  const burstAllowed = Math.max(1, Math.floor(limits.burstLimit10min / pace));
-  const used10min = countWithin(timestamps, WINDOW_10MIN);
-  if (used10min >= burstAllowed) {
-    throw new Error(`10 分钟突发上限：${kind} ${used10min}/${burstAllowed}${pace > 1 ? '（深夜减半）' : ''}，先歇一会儿再继续`);
-  }
-  const gap = limits.minGapMs * pace;
-  const lastAt = timestamps.length ? Math.max(...timestamps.map(t => Date.parse(t) || 0)) : 0;
-  const since = Date.now() - lastAt;
-  if (gap && lastAt && since < gap) {
-    const wait = rndInt(gap - since, gap - since + Math.round(gap * 0.5));
-    console.error(`[节流] 距上次 ${kind} ${Math.round(since / 1000)}s，等待约 ${Math.round(wait / 1000)}s${pace > 1 ? '（深夜减半）' : ''}`);
-    await humanPause(wait, wait + 500);
-  }
-}
-
-const matchSecurityPage = text => SECURITY_PAGE_RE.test(String(text || ''));
-
-function loadLock(file = LOCK_FILE) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return { locked: false }; }
-}
-
-function writeLock(reason, evidence = '', file = LOCK_FILE) {
-  const lock = { locked: true, reason, evidence: String(evidence).slice(0, 500), lockedAt: now() };
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(lock, null, 2));
-  return lock;
-}
-
-function assertNotLocked(file = LOCK_FILE) {
-  const lock = loadLock(file);
-  if (lock.locked) throw new Error(`账号熔断锁定中：${lock.reason}（${lock.lockedAt}）。禁止任何在线动作，人工确认后用 unlock --reason=说明 解除`);
-}
-
-function throwSecurity(reason, evidence = '', file = LOCK_FILE) {
-  writeLock(reason, evidence, file);
-  throw new Error(`${reason}，已停止并写入熔断锁 data/lock.json；人工确认前所有在线命令拒绝运行`);
-}
-
-// 平台级风控信号（code=32/36/37、访问受限等）当天不得解锁续跑：真实受限事件的共同失败路径
-// 就是"信号出现后继续访问几次"，而不是单次请求本身。普通异常（如 check 偶然发现的加载失败）
-// 不受此限制，可以随时解锁。
-function unlockRefusal(previous, at = Date.now()) {
-  if (!previous?.locked) return '';
-  if (!SEVERE_LOCK_RE.test(`${previous.reason || ''} ${previous.evidence || ''}`)) return '';
-  const lockedAt = Date.parse(previous.lockedAt || '') || 0;
-  if (!lockedAt) return '';
-  const sameDay = new Date(lockedAt).toDateString() === new Date(at).toDateString();
-  if (!sameDay && at - lockedAt >= WINDOW_24H) return '';
-  const earliest = new Date(lockedAt + WINDOW_24H).toLocaleString();
-  return `平台级风控信号当天不得解锁续跑：${previous.reason}，锁定于 ${previous.lockedAt}，最早可解锁 ${earliest}。确需提前解锁请加 --override-severe-lock 参数并自负风险`;
-}
-
-// 注意：这个开关只越过"风控级熔断当天冷静期"，不涉及发送、去重或送达核验任何一道门禁——
-// 那几道门禁本来就没有、也不该有绕过开关。
-function unlock() {
-  const reason = arg('reason');
-  if (!reason) throw new Error('解锁必须由人工给出 --reason=说明');
-  const previous = loadLock();
-  const overrideCooldown = process.argv.includes('--override-severe-lock');
-  const refusal = unlockRefusal(previous);
-  if (refusal && !overrideCooldown) throw new Error(refusal);
-  fs.writeFileSync(LOCK_FILE, JSON.stringify({
-    locked: false, unlockedAt: now(), unlockReason: reason,
-    ...(overrideCooldown && refusal ? { cooldownOverride: refusal } : {}),
-    previousLock: previous.locked ? previous : null,
-  }, null, 2));
-  console.log(`已解锁：${reason}${previous.locked ? `（上次锁定：${previous.reason} @ ${previous.lockedAt}）` : '（此前无锁定）'}`);
-  if (overrideCooldown && refusal) console.log(`⚠ 已用 --override-severe-lock 越过冷静期：${refusal}`);
-}
-
-// 连续空白 JD 计数存进台账（ledger.safety），不用内存变量：每条命令都是独立进程，
-// 内存计数器每次调用都会归零，等于这道闸门从未真正生效过。
-function noteEmptyJd(message) {
-  const ledger = loadLedger();
-  ledger.safety = ledger.safety || { consecutiveEmptyJd: 0 };
-  ledger.safety.consecutiveEmptyJd = (ledger.safety.consecutiveEmptyJd || 0) + 1;
-  saveLedger(ledger);
-  if (ledger.safety.consecutiveEmptyJd >= MAX_CONSECUTIVE_EMPTY_JD) {
-    throwSecurity(`连续 ${ledger.safety.consecutiveEmptyJd} 次空白/受限 JD（${message}）`, 'consecutive-empty-jd');
-  }
-}
-function resetEmptyJd() {
-  const ledger = loadLedger();
-  if (ledger.safety?.consecutiveEmptyJd) {
-    ledger.safety.consecutiveEmptyJd = 0;
-    saveLedger(ledger);
-  }
-}
-
-function unreadableJobMessage(page) {
-  const body = String(page?.bodyText || '');
-  if (/登录查看完整内容|登录后查看完整职位描述|请登录/.test(body)) return '登录态失效或职位正文受登录限制，已停止';
-  return 'JD 正文在 12 秒内未渲染，已停止';
-}
-
-const isClosedJobText = text => /职位已关闭|职位已下线|招聘已结束/.test(String(text || ''));
-
-const now = () => new Date().toISOString();
-const rel = file => path.relative(ROOT, file).replace(/\\/g, '/');
-const arg = name => {
-  const hit = process.argv.slice(2).find(x => x.startsWith(`--${name}=`));
-  return hit ? hit.slice(name.length + 3) : '';
-};
-const jobIdOf = text => String(text || '').match(/zhipin\.com\/job_detail\/([^/?#]+?)\.html/i)?.[1] || '';
-const emptyLedger = () => ({ version: 2, updatedAt: now(), jobs: [], conversations: [], interactions: [], companies: [], runs: [], safety: { consecutiveEmptyJd: 0 } });
 
 function assertConfigured() {
   if (!fs.existsSync(PREFERENCES_FILE) || !fs.existsSync(FACTS_FILE)) {
@@ -229,587 +62,6 @@ function assertConfigured() {
   if (!Object.keys(PROFILES).length) throw new Error('preferences.json 至少需要一个岗位方向');
 }
 
-function blankJob(id, url = '') {
-  return {
-    jobId: id, url: url || `https://www.zhipin.com/job_detail/${id}.html`, title: '', company: '', salary: '', sources: [],
-    discovery: { firstSeenAt: '', lastSeenAt: '', query: '', page: 0 },
-    preScreen: { status: 'unknown', profile: '', score: 0, activityRank: 0, reasons: [], checkedAt: '' },
-    decisions: [],
-    jd: { status: 'unknown', evidencePath: '', remoteHint: '', hash: '', structured: null },
-    review: { remote: { status: 'pending', evidence: '' }, pay: { status: 'pending', evidence: '' }, risk: { status: 'pending', evidence: '' } },
-    opener: { status: 'none', message: '', profile: '', jdHash: '', generatedAt: '', generator: '' },
-    outreach: { status: 'not_sent', message: '', evidencePath: '', verify: null },
-    reply: { status: 'unknown', lastMessage: '', checkedAt: '' }, nextAction: '',
-  };
-}
-
-function normalizeJob(job) {
-  const base = blankJob(job.jobId, job.url);
-  return {
-    ...base,
-    ...job,
-    discovery: { ...base.discovery, ...(job.discovery || {}) },
-    preScreen: { ...base.preScreen, ...(job.preScreen || {}) },
-    decisions: Array.isArray(job.decisions) ? job.decisions : [],
-    jd: { ...base.jd, ...(job.jd || {}) },
-    review: {
-      remote: { ...base.review.remote, ...(job.review?.remote || {}) },
-      pay: { ...base.review.pay, ...(job.review?.pay || {}) },
-      risk: { ...base.review.risk, ...(job.review?.risk || {}) },
-    },
-    opener: { ...base.opener, ...(job.opener || {}) },
-    outreach: { ...base.outreach, ...(job.outreach || {}) },
-    reply: { ...base.reply, ...(job.reply || {}) },
-  };
-}
-
-function addDecision(job, stage, status, code, message, evidence = '') {
-  const decision = { stage, status, code, message, evidence, at: now() };
-  job.decisions = (job.decisions || []).filter(x => !(x.stage === stage && x.code === code));
-  job.decisions.push(decision);
-  return decision;
-}
-
-function activityRank(text) {
-  const value = String(text || '');
-  if (/在线|刚刚活跃/.test(value)) return 100;
-  if (/今日活跃|今天活跃/.test(value)) return 90;
-  if (/三日内活跃|\d+天内活跃/.test(value)) return 80;
-  if (/本周活跃/.test(value)) return 70;
-  if (/本月活跃/.test(value)) return 50;
-  if (/\d+[周月]内活跃/.test(value)) return 30;
-  return 0;
-}
-
-function includesKeyword(text, keyword) {
-  return String(text || '').toLocaleLowerCase().includes(String(keyword).toLocaleLowerCase());
-}
-
-function matchProfile(title, description = '', requested = '') {
-  if (requested) {
-    if (!PROFILES[requested]) throw new Error(`未知岗位方向 ${requested}`);
-    const profile = PROFILES[requested];
-    return [...profile.titleKeywords, ...profile.jdKeywords].some(word => includesKeyword(`${title}\n${description}`, word)) ? requested : '';
-  }
-  const scores = Object.entries(PROFILES).map(([id, profile]) => {
-    const titleScore = profile.titleKeywords.filter(word => includesKeyword(title, word)).length * 3;
-    const jdScore = profile.jdKeywords.filter(word => includesKeyword(description, word)).length;
-    return { id, score: titleScore + jdScore };
-  }).sort((a, b) => b.score - a.score);
-  return scores[0]?.score > 0 ? scores[0].id : '';
-}
-
-function parseSearchCard(card = {}) {
-  const text = String(card.text || '').replace(/\r/g, '').trim();
-  const lines = text.split('\n').map(x => x.trim()).filter(Boolean);
-  const salary = text.match(/(?:\d+(?:\.\d+)?-\d+(?:\.\d+)?K(?:·\d+薪)?|\d+(?:\.\d+)?-\d+(?:\.\d+)?元\/(?:时|天|月))/i)?.[0] || '';
-  const linkTitle = /查看更多|查看详情|立即沟通/.test(card.title || '') ? '' : card.title;
-  const title = String(linkTitle || lines.find(x => x !== salary && !/^[·•]$/.test(x) && !/查看更多|查看详情|立即沟通/.test(x)) || '').replace(salary, '').trim();
-  return { title, salary, text };
-}
-
-
-
-function preScreenJob(ledger, job, card = {}, requestedProfile = '') {
-  const parsed = parseSearchCard(card);
-  if (!job.title && parsed.title) job.title = parsed.title;
-  if (!job.salary && parsed.salary) job.salary = parsed.salary;
-  const profile = matchProfile(job.title, parsed.text, requestedProfile);
-  const reasons = [];
-  let status = 'review';
-  let score = 0;
-  const contacted = priorContactReason(ledger, job);
-  const defaultRedlines = ['贷款', '收费', '传销'];
-  const hardExclusions = [...defaultRedlines, ...(Array.isArray(PREFERENCES.requirements?.hardExclusions) ? PREFERENCES.requirements.hardExclusions : [])];
-  const obviousRedline = hardExclusions.find(word => includesKeyword(job.title, word));
-  if (!job.title || /查看更多|查看详情|立即沟通/.test(job.title)) {
-    status = 'review';
-    reasons.push({ code: 'missing_list_title', message: '列表链接缺少可用标题，放到队尾人工确认', evidence: parsed.text.slice(0, 100) });
-  } else if (contacted) {
-    status = 'reject';
-    reasons.push({ code: 'prior_contact', message: contacted, evidence: contacted });
-  } else if (obviousRedline) {
-    status = 'reject';
-    reasons.push({ code: 'title_redline', message: '岗位标题命中明确红线', evidence: obviousRedline });
-  } else if (!profile) {
-    status = 'reject';
-    reasons.push({ code: 'direction_mismatch', message: '标题和列表信息未命中配置的岗位方向', evidence: job.title });
-  } else {
-    score += 30;
-    reasons.push({ code: 'direction_match', message: `命中${PROFILES[profile].label}`, evidence: job.title });
-    if (/远程|居家|线上/.test(parsed.text)) {
-      score += 30;
-      status = 'priority';
-      reasons.push({ code: 'remote_hint', message: '列表出现远程信号，仍需完整 JD 核实', evidence: parsed.text.match(/.{0,12}(?:远程|居家|线上).{0,12}/)?.[0] || '' });
-    } else {
-      status = 'review';
-      reasons.push({ code: 'remote_unknown', message: '列表没有远程证据，完整 JD 前排在远程信号之后', evidence: '' });
-    }
-    if (job.salary) score += 10;
-  }
-  const rank = activityRank(card.activityText || job.jd?.structured?.recruiter?.activeText);
-  job.preScreen = { status, profile, score, activityRank: rank, reasons, checkedAt: now() };
-  addDecision(job, 'pre_screen', status === 'reject' ? 'reject' : 'pass', reasons[0]?.code || 'review', reasons.map(x => x.message).join('；'), reasons.map(x => x.evidence).filter(Boolean).join('；'));
-  return job.preScreen;
-}
-
-function findHrName(text, companyName) {
-  if (!text) return '';
-  const lines = text.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
-  const activeIdx = lines.findIndex(l => /^(在线|刚刚活跃|今天活跃|三日内活跃|本周活跃|本月活跃|\d+天内活跃|\d+周内活跃|\d+月内活跃)$/.test(l));
-  if (activeIdx > 0) return lines[activeIdx - 1];
-  const dotIdx = lines.findIndex(l => l === '·');
-  if (dotIdx > 0) {
-    if (dotIdx >= 2 && lines[dotIdx - 1] === companyName) return lines[dotIdx - 2];
-    if (dotIdx >= 3 && lines[dotIdx - 1] === companyName && lines[dotIdx - 3]) return lines[dotIdx - 3];
-  }
-  return '';
-}
-
-function recruiterFromButton(button = {}, name = '', company = '') {
-  let encryptBossId = '';
-  try {
-    encryptBossId = new URL(button.redirectUrl || '', 'https://www.zhipin.com').searchParams.get('id') || '';
-  } catch {}
-  return {
-    encryptBossId,
-    name,
-    company,
-    isFriend: button.isFriend === true || button.isFriend === 'true',
-  };
-}
-
-function conversationKey(item) {
-  if (item.encryptBossId) return `boss:${item.encryptBossId}`;
-  if (item.friendId) return `friend:${item.friendId}`;
-  return `name:${item.company || ''}@@${item.name || ''}`;
-}
-
-function priorContactReason(ledger, job, recruiter = job.recruiter || {}) {
-  if (recruiter.isFriend) return 'BOSS 标记该招聘者已沟通';
-  const conversations = ledger.conversations || [];
-  if (conversations.some(c => c.encryptJobId && c.encryptJobId === job.jobId)) return '该岗位已存在会话';
-  if (recruiter.encryptBossId && conversations.some(c => c.encryptBossId === recruiter.encryptBossId)) return '该招聘者已存在会话';
-  if (recruiter.encryptBossId && ledger.jobs.some(other =>
-    other.jobId !== job.jobId &&
-    other.recruiter?.encryptBossId === recruiter.encryptBossId &&
-    other.outreach?.status !== 'not_sent'
-  )) return '该招聘者已通过其他岗位沟通过';
-  if (recruiter.name && recruiter.company && conversations.some(c =>
-    c.name === recruiter.name && c.company === recruiter.company
-  )) return '同公司同名招聘者已存在会话';
-  return '';
-}
-
-function ensureJob(ledger, id, url = '') {
-  let job = ledger.jobs.find(x => x.jobId === id);
-  if (!job) { job = blankJob(id, url); ledger.jobs.push(job); }
-  else Object.assign(job, normalizeJob(job));
-  if (url) job.url = url;
-  return job;
-}
-
-function loadLedger() {
-  if (!fs.existsSync(LEDGER_FILE)) return emptyLedger();
-  return { ...emptyLedger(), ...JSON.parse(fs.readFileSync(LEDGER_FILE, 'utf8')) };
-}
-
-function saveLedger(ledger) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  ledger.version = 2;
-  ledger.updatedAt = now();
-  const tmp = LEDGER_FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(ledger, null, 2) + '\n', 'utf8');
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      fs.renameSync(tmp, LEDGER_FILE);
-      break;
-    } catch (error) {
-      if (!['EPERM', 'EACCES', 'EBUSY'].includes(error.code) || attempt >= 4) throw error;
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100 * (attempt + 1));
-    }
-  }
-}
-
-function walk(dir) {
-  if (!fs.existsSync(dir)) return [];
-  return fs.readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
-    const full = path.join(dir, entry.name);
-    return entry.isDirectory() ? walk(full) : [full];
-  });
-}
-
-const REMOTE_POSITIVE = /全程远程|全职远程|远程办公|居家办公|居家工作|线上办公|线上协作|接受远程|支持远程|可远程|可居家|远程工作|远程兼职|远程项目/;
-const REMOTE_NEGATIVE = /不支持远程|不接受远程|不能远程|无法远程|必须到岗|需到岗|需要到岗|现场办公|驻场办公|线下坐班|必须坐班|仅限本地到岗/;
-const REMOTE_TITLE = /远程|居家|线上办公|线上协作/;
-
-function assessRemote(title = '', description = '') {
-  const bodyLines = String(description || '').split(/\r?\n|(?<=[。；])/).map(x => x.trim()).filter(Boolean);
-  const negative = bodyLines.find(x => REMOTE_NEGATIVE.test(x));
-  if (negative) return { status: 'fail', evidence: negative, source: 'body' };
-  const bodyPositive = bodyLines.find(x => REMOTE_POSITIVE.test(x) && !/远程面试/.test(x));
-  if (bodyPositive) return { status: 'pass', evidence: bodyPositive, source: 'body' };
-  const cleanTitle = String(title || '').replace(/远程面试/g, '');
-  if (REMOTE_TITLE.test(cleanTitle)) return { status: 'pass', evidence: String(title).trim(), source: 'title' };
-  return { status: 'pending', evidence: '', source: '' };
-}
-
-function parseJobBody(body) {
-  const lines = String(body || '').split(/\r?\n/).map(x => x.trim()).filter(Boolean);
-  const recruiting = lines.indexOf('招聘中');
-  const titleSalary = recruiting >= 0 ? lines[recruiting + 1] || '' : '';
-  const companyAt = lines.indexOf('公司基本信息');
-  const company = companyAt >= 0 ? lines[companyAt + 1] || '' : '';
-  const salary = titleSalary.match(/(?:\d+(?:\.\d+)?-\d+(?:\.\d+)?K(?:·\d+薪)?|\d+-\d+元\/(?:时|天|月))/i)?.[0] || '';
-  const title = salary ? titleSalary.slice(0, titleSalary.indexOf(salary)).trim() : titleSalary;
-  const remoteEvidence = assessRemote(title, body).evidence;
-  return { title, company, salary, remoteEvidence };
-}
-
-function jobPageExpression() {
-  return `(()=>{
-    const text=(el)=>(el?.innerText||'').replace(/\\s+/g,' ').trim();
-    const section=(name)=>{
-      const heading=[...document.querySelectorAll('.job-detail h2,.job-detail h3,.job-detail .job-sec-title')].find(x=>text(x)===name);
-      const box=heading?.closest('.detail-section-item,.job-detail-section,.job-sec,.job-box')||heading?.parentElement;
-      return box ? text(box).replace(name,'').trim() : '';
-    };
-    const b=document.querySelector('.btn-startchat');
-    const description=text(document.querySelector('.job-sec-text'));
-    const primary=text(document.querySelector('.job-primary'));
-    const recruiterBox=document.querySelector('.job-boss-info');
-    const recruiterNameEl=recruiterBox?.querySelector('.name');
-    const recruiterState=text(recruiterBox?.querySelector('.boss-active-time,.boss-online-tag'));
-    const recruiterName=recruiterNameEl ? text(recruiterNameEl).replace(recruiterState,'').trim() : '';
-    const recruiterAttr=text(recruiterBox?.querySelector('.boss-info-attr'));
-    const attrParts=recruiterAttr.split('·').map(x=>x.trim()).filter(Boolean);
-    const bodyText=document.body.innerText||'';
-    const salary=(description.match(/\\d+(?:\\.\\d+)?-\\d+(?:\\.\\d+)?(?:K(?:·\\d+薪)?|元\\/(?:时|天|月))/i)||bodyText.match(/\\d+(?:\\.\\d+)?-\\d+(?:\\.\\d+)?(?:K(?:·\\d+薪)?|元\\/(?:时|天|月))/i)||[])[0]||'';
-    return JSON.stringify({
-      url:location.href,bodyText,
-      security:location.href.includes('security_check')||location.href.includes('/403.html')||/[?&]code=(32|36|37)(&|$)/.test(location.href)||location.href.includes('/web/passport/')||!!document.querySelector('.security-check,.verify-wrap,.captcha')||/账户存在异常行为|暂时限制访问|访问受限/.test(bodyText),
-      structured:{
-        title:document.querySelector('.job-banner h1[title]')?.getAttribute('title')||text(document.querySelector('.job-banner h1')),
-        company:attrParts[0]||'',
-        salary,
-        description,
-        benefits:[...new Set([...(document.querySelector('.job-tags')?.querySelectorAll('span,li')||[])].map(text).filter(Boolean))].join('、'),
-        companyIntroduction:section('公司介绍'),
-        businessInformation:section('工商信息'),
-        address:section('工作地址'),
-        experience:(primary.match(/经验不限|应届生|\\d+-\\d+年|\\d+年以上/)||[])[0]||'',
-        education:(primary.match(/学历不限|初中|中专|高中|大专|本科|硕士|博士/)||[])[0]||'',
-        tags:[...new Set([...(document.querySelector('.job-tags')?.querySelectorAll('span,li')||[])].map(text).filter(Boolean))],
-        recruiter:{name:recruiterName,title:attrParts.slice(1).join(' · '),activeText:recruiterState},
-        incomplete:/登录查看完整内容|登录后查看完整职位描述/.test(description)
-      },
-      button:{text:text(b),redirectUrl:b?.getAttribute('redirect-url')||'',isFriend:b?.dataset?.isfriend||''}
-    });
-  })()`;
-}
-
-function normalizeStructuredPage(page) {
-  const structured = page.structured || {};
-  const fallback = parseJobBody(page.bodyText || '');
-  structured.title ||= fallback.title;
-  structured.company ||= fallback.company;
-  structured.salary ||= fallback.salary;
-  structured.description ||= '';
-  structured.tags = Array.isArray(structured.tags) ? structured.tags : [];
-  structured.recruiter = structured.recruiter || { name: '', title: '', activeText: '' };
-  structured.recruiter.activityRank = activityRank(structured.recruiter.activeText);
-  const remoteEvidence = assessRemote(structured.title, structured.description).evidence;
-  const hashSource = JSON.stringify({
-    title: structured.title,
-    company: structured.company,
-    description: structured.description,
-    benefits: structured.benefits || '',
-    address: structured.address || '',
-    experience: structured.experience || '',
-    education: structured.education || '',
-  });
-  return { structured, remoteEvidence, hash: crypto.createHash('sha256').update(hashSource).digest('hex') };
-}
-
-function assertReadableDescription(description) {
-  if (!String(description || '').trim()) throw new Error('JD 正文为空，已停止');
-}
-
-function hydrateLegacyStructured(job) {
-  if (job.jd?.structured?.description || !job.jd?.text) return normalizeJob(job);
-  const normalized = normalizeJob(job);
-  const body = String(job.jd.text);
-  const start = body.indexOf('职位描述');
-  const companyAt = body.indexOf('\n公司介绍', start + 4);
-  const competitionAt = body.indexOf('\n竞争力分析', start + 4);
-  const end = companyAt > start ? companyAt : competitionAt > start ? competitionAt : body.length;
-  let description = start >= 0 ? body.slice(start + 4, end).trim() : body;
-  if (competitionAt > start && (!companyAt || companyAt < 0)) {
-    description = description.replace(/\n[^\n]+\n(?:在线|刚刚活跃|今天活跃|三日内活跃|本周活跃|本月活跃)\n[^\n]+\n·\n[^\n]+$/s, '').trim();
-  }
-  const primary = body.slice(0, Math.max(0, start));
-  const companyIntroEnd = body.indexOf('\n工商信息', companyAt + 1);
-  const addressAt = body.indexOf('\n工作地址', Math.max(companyAt, 0) + 1);
-  const structured = {
-    title: normalized.title,
-    company: normalized.company,
-    salary: normalized.salary,
-    description,
-    benefits: '',
-    companyIntroduction: companyAt >= 0 ? body.slice(companyAt + 5, companyIntroEnd > companyAt ? companyIntroEnd : body.length).trim() : '',
-    businessInformation: '',
-    address: addressAt >= 0 ? body.slice(addressAt + 5).split('\n').filter(Boolean)[0] || '' : '',
-    experience: (primary.match(/经验不限|应届生|\d+-\d+年|\d+年以上/) || [])[0] || '',
-    education: (primary.match(/学历不限|初中|中专|高中|大专|本科|硕士|博士/) || [])[0] || '',
-    tags: [],
-    recruiter: { name: normalized.recruiter?.name || '', title: normalized.recruiter?.title || '', activeText: normalized.recruiter?.activeText || '', activityRank: normalized.recruiter?.activityRank || 0 },
-    incomplete: /登录查看完整内容/.test(description),
-  };
-  const parsed = normalizeStructuredPage({ structured, bodyText: body });
-  normalized.jd = { ...normalized.jd, structured: parsed.structured, hash: parsed.hash, remoteHint: parsed.remoteEvidence };
-  return normalized;
-}
-
-function validateOpener(message) {
-  const value = String(message || '').replace(/^["“]|["”]$/g, '').replace(/\s+/g, ' ').trim();
-  const minLength = Number(PREFERENCES.opener?.minLength || 20);
-  const maxLength = Number(PREFERENCES.opener?.maxLength || 180);
-  if (value.length < minLength || value.length > maxLength) throw new Error(`开场白长度必须在 ${minLength}–${maxLength} 字之间`);
-  const bannedClaims = Array.isArray(PREFERENCES.opener?.bannedClaims) ? PREFERENCES.opener.bannedClaims : [];
-  const banned = bannedClaims.find(claim => includesKeyword(value, claim));
-  if (banned) throw new Error(`开场白含用户禁止声称的经历：${banned}`);
-  if (/https?:\/\/|www\./i.test(value)) throw new Error('开场白不得主动附带链接');
-  return value;
-}
-
-function assertSendReady(job) {
-  if (job.jd?.status !== 'read' || job.jd?.liveStatus === 'partial' || !job.jd?.structured?.description || job.jd.structured.incomplete) throw new Error('未读取完整结构化 JD');
-  for (const field of ['remote', 'pay', 'risk']) {
-    if (job.review?.[field]?.status !== 'pass') throw new Error(`${field} 尚未通过审核`);
-  }
-  if (job.outreach?.status !== 'not_sent') throw new Error(`该岗位状态为 ${job.outreach?.status || 'unknown'}，禁止再次发送`);
-}
-
-function assertAgentReady(ledger, job) {
-  assertSendReady(job);
-  const reason = priorContactReason(ledger, job);
-  if (reason) throw new Error(reason);
-}
-
-// 审核所需的最小载荷：agent 判断 remote/pay/risk 需要的字段 + JD 正文，一次给全。
-// 没有这个出口时，agent 想审岗必须先看 JD，想看 JD（opener-context）又必须先审完岗，
-// 唯一出路是直接去读 data/ledger.json——而台账每个岗位约 5KB，几百个岗位就足以塞爆上下文。
-// 这个函数存在的意义就是让"读台账"永远没有必要。
-function reviewPayload(job) {
-  const structured = job.jd?.structured || {};
-  return {
-    jobId: job.jobId,
-    title: job.title,
-    company: job.company,
-    salary: job.salary || structured.salary || '',
-    experience: structured.experience || '',
-    education: structured.education || '',
-    remoteHint: job.jd?.remoteHint || '',
-    recruiterActive: job.recruiter?.activeText || '',
-    jdStatus: job.jd?.status || 'unknown',
-    descriptionChars: String(structured.description || '').length,
-    description: structured.description || '',
-    benefits: structured.benefits || '',
-    review: Object.fromEntries(['remote', 'pay', 'risk'].map(k => [k, job.review?.[k]?.status || 'pending'])),
-    outreachStatus: job.outreach?.status || 'not_sent',
-  };
-}
-
-// 离线复看已读过的 JD，不联网、不占速率闸门。
-// 用于 agent 上下文被压缩后重新拿回某个岗位的正文，而不是去翻台账。
-function showJd() {
-  const input = process.argv[3] || arg('url');
-  const id = jobIdOf(input) || input;
-  const ledger = loadLedger();
-  const index = ledger.jobs.findIndex(x => x.jobId === id);
-  const job = index >= 0 ? hydrateLegacyStructured(ledger.jobs[index]) : null;
-  if (!job) throw new Error(`台账中没有岗位 ${id}`);
-  if (!String(job.jd?.structured?.description || '').trim()) throw new Error(`岗位 ${id} 尚无完整 JD 正文，请先运行 read`);
-  console.log(JSON.stringify(reviewPayload(job), null, 2));
-}
-
-
-
-// 只识别无法在当前页面关闭的硬性拦截；"完善在线简历"的"好的"提示会在发送页内关闭后继续。
-function detectSendBlock(text) {
-  if (!text) return '';
-  if (/交换(微信|手机号)|请先绑定(微信|手机)|先交换/.test(text)) return 'BOSS 要求先交换联系方式才能沟通';
-  return '';
-}
-
-// brief=true 时省掉 userProfile 和 description 两个字段。
-// 这两块在一轮工作流里都是重复内容：JD 正文 agent 刚在 read --jd 里看过，
-// 事实档案（profile.md）整个 session 一个字都不会变，却被每个岗位重发一次——
-// 处理几十个岗位时，光这两项就占掉总载荷的一半以上。
-// brief 模式要求调用方确保 profile.md 已在本 session 加载过一次。
-function buildOpenerContext(job, profileId, brief = false) {
-  const profile = PROFILES[profileId] || PROFILES[matchProfile(job.title, job.jd?.structured?.description || '')];
-  if (!profile) throw new Error('岗位未匹配用户配置的求职方向，不能生成开场白');
-  const structured = job.jd?.structured || {};
-  const context = {
-    instruction: brief
-      ? '根据本 session 已加载的用户事实档案（profile.md）和下述岗位信息撰写首次沟通开场白。只使用用户已确认的事实，不虚构任何经历，不写链接。'
-      : '根据用户事实档案和岗位 JD 撰写首次沟通开场白。只使用用户已确认的事实，不虚构任何经历，不写链接。',
-    profile: { id: profileId, label: profile.label, factFocus: profile.factFocus || '' },
-    job: {
-      jobId: job.jobId, title: job.title, company: job.company,
-      salary: job.salary || structured.salary || '', experience: structured.experience || '',
-      education: structured.education || '',
-      ...(brief ? {} : { description: structured.description }),
-      benefits: structured.benefits || '',
-    },
-    ...(brief ? { userProfileSource: rel(FACTS_FILE) } : { userProfile: fs.readFileSync(FACTS_FILE, 'utf8') }),
-    openerRules: PREFERENCES.opener || {},
-  };
-  return context;
-}
-
-function openerContext(job, requestedProfile = '', brief = false) {
-  if (job.jd?.status !== 'read' || !job.jd?.structured?.description || job.jd.structured.incomplete) throw new Error('未读取完整结构化 JD');
-  const profileId = matchProfile(job.title, job.jd.structured.description, requestedProfile || job.preScreen?.profile);
-  return buildOpenerContext(job, profileId, brief);
-}
-
-function verifyFrom(value) {
-  const rows = Array.isArray(value) ? value : [value];
-  const verify = rows.find(x => x && x.verify)?.verify || value?.verify || {};
-  return {
-    inputEmpty: verify.inputEmpty === true,
-    hasMyMsg: verify.hasMyMsg === true,
-    hasSongda: verify.hasSongda === true,
-  };
-}
-
-function conversationStatus(item) {
-  const ours = /status/.test(item.statusClass || '');
-  if (ours) return /read/.test(item.statusClass) ? 'ours_last_read' : 'ours_last_delivered';
-  if (/不.{0,2}合适|不考虑|暂不|抱歉|对不起|已招到|停止招聘|不支持远程|早日找到/.test(item.lastMessage || '')) return 'closed';
-  if (/[?？]|加.{0,4}(微信|手机号)|发.{0,6}(简历|作品|样片|案例)|看下|提供|方便|可以/.test(item.lastMessage || '')) return 'needs_reply';
-  return 'boss_last_review';
-}
-
-function sentVerification(sent) {
-  return {
-    inputEmpty: sent?.inputEmpty === true,
-    exactMessage: sent?.exactMessageCount === 1,
-    sameRowDelivered: /status-(?:delivery|read)/.test(sent?.sameRowStatusClass || ''),
-    companyVisible: sent?.companyVisible === true,
-  };
-}
-
-function importLegacy() {
-  const previous = new Map(loadLedger().jobs.map(job => [job.jobId, job]));
-  const jobs = new Map();
-  const ensure = (id, url = '') => {
-    if (!id) return null;
-    if (!jobs.has(id)) jobs.set(id, {
-      jobId: id,
-      url: url || `https://www.zhipin.com/job_detail/${id}.html`,
-      title: '', company: '', salary: '',
-      sources: [],
-      jd: { status: 'unknown', evidencePath: '', remoteHint: '' },
-      review: {
-        remote: { status: 'pending', evidence: '' },
-        pay: { status: 'pending', evidence: '' },
-        risk: { status: 'pending', evidence: '' },
-      },
-      outreach: { status: 'not_sent', message: '', evidencePath: '', verify: null },
-      reply: { status: 'unknown', lastMessage: '', checkedAt: '' },
-      nextAction: '',
-    });
-    return jobs.get(id);
-  };
-
-  const files = walk(ARCHIVE);
-  for (const file of files.filter(x => /\.(?:md|json)$/i.test(x))) {
-    let text;
-    try { text = fs.readFileSync(file, 'utf8'); } catch { continue; }
-    const urls = text.match(/https?:\/\/(?:www\.)?zhipin\.com\/job_detail\/[^\s)\]"']+?\.html/gi) || [];
-    for (const url of urls) {
-      const job = ensure(jobIdOf(url), url);
-      if (job && !job.sources.includes(rel(file))) job.sources.push(rel(file));
-    }
-
-    if (/[/\\]jd_[^/\\]+\.json$/i.test(file)) {
-      try {
-        const value = JSON.parse(text);
-        const id = jobIdOf(value.url) || path.basename(file).match(/^jd_(.+)\.json$/i)?.[1] || '';
-        const job = ensure(id, value.url);
-        const parsed = parseJobBody(value.body);
-        Object.assign(job, Object.fromEntries(Object.entries(parsed).filter(([key, val]) => key !== 'remoteEvidence' && val)));
-        job.jd = { status: value.body ? 'read' : 'empty', evidencePath: rel(file), remoteHint: parsed.remoteEvidence };
-        if (!job.sources.includes(rel(file))) job.sources.push(rel(file));
-      } catch {}
-    }
-
-    if (/[/\\](?:send_[^/\\]+|verify_final)\.json$/i.test(file)) {
-      try {
-        const value = JSON.parse(text);
-        const url = (Array.isArray(value) ? value.find(x => x?.url)?.url : value.url) || '';
-        const id = jobIdOf(url) || path.basename(file).match(/^send_(.+)\.json$/i)?.[1] || '';
-        const job = ensure(id, url);
-        const verify = verifyFrom(value);
-        if (verify.inputEmpty && verify.hasMyMsg && verify.hasSongda) {
-          job.outreach = { ...job.outreach, status: 'delivered_legacy', evidencePath: rel(file), verify };
-        }
-        if (!job.sources.includes(rel(file))) job.sources.push(rel(file));
-      } catch {}
-    }
-  }
-
-  for (const [id, old] of previous) {
-    const imported = ensure(id, old.url);
-    jobs.set(id, {
-      ...imported,
-      ...old,
-      sources: [...new Set([...(imported.sources || []), ...(old.sources || [])])],
-      jd: { ...imported.jd, ...old.jd },
-      review: { ...imported.review, ...old.review },
-      outreach: { ...imported.outreach, ...old.outreach },
-      reply: { ...imported.reply, ...old.reply },
-    });
-  }
-
-  const ledger = loadLedger();
-  ledger.jobs = [...jobs.values()].sort((a, b) => a.jobId.localeCompare(b.jobId));
-  saveLedger(ledger);
-  console.log(`已导入 ${ledger.jobs.length} 个历史岗位；有 JD ${ledger.jobs.filter(x => x.jd.status === 'read').length}；有旧送达证据 ${ledger.jobs.filter(x => x.outreach.status === 'delivered_legacy').length}`);
-}
-
-function validate() {
-  const ledger = loadLedger();
-  const errors = [];
-  const seen = new Set();
-  for (const job of ledger.jobs) {
-    if (!job.jobId || seen.has(job.jobId)) errors.push(`重复或空 jobId: ${job.jobId}`);
-    seen.add(job.jobId);
-    if (jobIdOf(job.url) !== job.jobId) errors.push(`链接不匹配: ${job.jobId}`);
-    for (const evidence of [job.jd?.evidencePath, job.outreach?.evidencePath].filter(Boolean)) {
-      const full = path.resolve(ROOT, evidence);
-      if (!full.startsWith(ROOT + path.sep) || !fs.existsSync(full)) errors.push(`证据路径失效: ${job.jobId} -> ${evidence}`);
-    }
-    if (job.jd?.status === 'read' && JD_GARBAGE_RE.test(job.jd?.structured?.description || '')) errors.push(`疑似登录页垃圾 JD: ${job.jobId}`);
-    if (/^delivered/.test(job.outreach?.status || '')) {
-      const v = job.outreach.verify || {};
-      const validLegacy = v.inputEmpty && v.hasMyMsg && v.hasSongda;
-      const validCurrent = v.inputEmpty && v.exactMessage && v.sameRowDelivered && v.companyVisible;
-      if (!(validLegacy || validCurrent)) errors.push(`送达核验不完整: ${job.jobId}`);
-    }
-  }
-  const conversationKeys = new Set();
-  for (const conversation of ledger.conversations) {
-    const key = conversationKey(conversation);
-    if (conversationKeys.has(key)) errors.push(`重复会话身份: ${key}`);
-    conversationKeys.add(key);
-  }
-  assert.equal(errors.length, 0, errors.join('\n'));
-  console.log(`VALID ${ledger.jobs.length} jobs / ${ledger.conversations.length} conversations / ${ledger.companies.length} companies`);
-}
 
 async function check() {
   const tabs = await fetch(`http://127.0.0.1:${PORT}/json`).then(r => r.json());
@@ -818,7 +70,7 @@ async function check() {
   console.log(JSON.stringify({ port: PORT, bossTabs: boss.length, securityPages: security.length, urls: boss.map(x => x.url) }, null, 2));
   if (security.length) {
     writeLock('check 发现安全/异常页面', security.map(x => `${x.url} ${x.title}`).join(' ; '));
-    console.log('已写入熔断锁 data/lock.json：所有在线命令拒绝运行，人工确认后 unlock');
+    console.log(`已写入熔断锁 ${rel(LOCK_FILE)}：所有在线命令拒绝运行，人工确认后 unlock`);
   }
   if (!boss.length || security.length) process.exitCode = 2;
 }
@@ -902,7 +154,7 @@ async function profile() {
   const cdp = await openTab('https://www.zhipin.com/web/geek/resume', PORT);
   try {
     await humanPause(3000, 6500);
-    const raw = await cdp.eval(`JSON.stringify({url:location.href,security:location.href.includes('security_check')||!!document.querySelector('.security-check,.verify-wrap,.captcha'),expectations:document.querySelector('#purpose')?.innerText.replace(/\\s+/g,' ').trim()||'',advantage:document.querySelector('#summary .advantage-text')?.innerText.trim()||'',attachments:[...document.querySelectorAll('a')].filter(a=>/\\.pdf$/i.test((a.innerText||'').trim())).map(a=>(a.innerText||'').trim())})`);
+    const raw = await cdp.eval(`JSON.stringify({url:location.href,security:${SECURITY_JS_EXPR},expectations:document.querySelector('#purpose')?.innerText.replace(/\\s+/g,' ').trim()||'',advantage:document.querySelector('#summary .advantage-text')?.innerText.trim()||'',attachments:[...document.querySelectorAll('a')].filter(a=>/\\.pdf$/i.test((a.innerText||'').trim())).map(a=>(a.innerText||'').trim())})`);
     const snapshot = { ...JSON.parse(raw || '{}'), checkedAt: now() };
     const ledger = loadLedger();
     ledger.profile = snapshot;
@@ -915,14 +167,14 @@ async function profile() {
 }
 
 async function readJob() {
-  const input = process.argv[3] || arg('url');
+const input = positional() || arg('url');
   const id = jobIdOf(input) || (/^[\w-]+$/.test(input || '') ? input : '');
   const ledger = loadLedger();
   const existing = id ? ledger.jobs.find(x => x.jobId === id) : null;
   const url = jobIdOf(input) ? input : existing?.url;
   if (!id) throw new Error('需要有效的 BOSS 岗位详情链接');
   if (!url) throw new Error(`台账中没有岗位 ${id} 的详情链接`);
-  await guardRate('jobReads', ledger);
+  await reserveAction('jobReads', id);
   const { openTab, closeTab } = cdpLib();
   const cdp = await openTab(url, PORT);
   try {
@@ -934,7 +186,19 @@ async function readJob() {
       if (page.security || (jobIdOf(page.url) === id && String(page.structured?.description || '').trim())) break;
       await humanPause(600, 1200);
     } while (Date.now() < deadline);
-    if (page.security || jobIdOf(page.url) !== id) throwSecurity('岗位页进入安全验证或发生跳转', `${id} -> ${page.url || ''}`);
+    if (page.security) throwSecurity('岗位页进入安全验证', `${id} -> ${page.url || ''}`);
+    if (jobIdOf(page.url) !== id) {
+      if (!isExpiredJobRedirect(page.url)) throwSecurity('岗位页发生异常跳转', `${id} -> ${page.url || ''}`);
+      const ledger = loadLedger();
+      const job = ensureJob(ledger, id, url);
+      job.jd = { ...(job.jd || {}), status: 'expired', checkedAt: now() };
+      job.nextAction = '岗位已失效（详情页跳回首页/列表）';
+      job.preScreen = { ...(job.preScreen || {}), status: 'reject', reason: job.nextAction };
+      addDecision(job, 'jd_read', 'reject', 'job_expired', job.nextAction, page.url || '');
+      saveLedger(ledger);
+      console.log(`EXPIRED ${id} 岗位详情页跳回 ${page.url}，已标记失效，未写熔断锁`);
+      return;
+    }
     if (!String(page.structured?.description || '').trim()) {
       noteEmptyJd(unreadableJobMessage(page));
       throw new Error(unreadableJobMessage(page));
@@ -965,7 +229,7 @@ async function readJob() {
     saveLedger(ledger);
     // --jd 直接带出审核所需的全部字段（含 JD 正文），省掉紧接着的第二次命令往返；
     // 审岗本来就必须看正文，把它拆成两次调用只是多花一轮工具开销。
-    if (process.argv.includes('--jd')) {
+if (hasFlag('jd')) {
       console.log(JSON.stringify(reviewPayload(job), null, 2));
     } else {
       console.log(JSON.stringify({
@@ -980,56 +244,8 @@ async function readJob() {
   }
 }
 
-async function search() {
-  const query = process.argv[3] || arg('query');
-  const page = Number(arg('page') || 1);
-  const requestedProfile = arg('profile');
-  if (requestedProfile && !PROFILES[requestedProfile]) throw new Error(`未知岗位方向 ${requestedProfile}`);
-  if (!query) throw new Error('需要搜索词');
-  // 搜索结果页是单页应用，?page= 参数会被前端忽略（p1/p2/p3 拿到的内容完全一样）；
-  // 真正翻页必须在页面里点分页按钮或滚动加载，用 URL 参数硬翻只会重复读同一屏还白占额度。
-  if (page !== 1) throw new Error('搜索页 ?page= 参数会被前端忽略，翻页请在页面内点分页按钮或滚动加载；此命令只接受 page=1');
-  const url = `https://www.zhipin.com/web/geek/jobs?query=${encodeURIComponent(query)}&city=${encodeURIComponent(CITY_CODE)}`;
-  const ledger = loadLedger();
-  await guardRate('searchPages', ledger);
-  const { openTab, closeTab } = cdpLib();
-  const cdp = await openTab(url, PORT);
-  try {
-    await humanPause(4000, 9000);
-    const raw = await cdp.eval(`JSON.stringify({url:location.href,security:location.href.includes('security_check')||!!document.querySelector('.security-check,.verify-wrap,.captcha'),links:[...document.querySelectorAll('a[href*="/job_detail/"]')].map(a=>{const card=a.closest('li,.job-card-wrapper,.job-card-box,.job-list-box')||a.parentElement;return {url:a.href,title:(a.innerText||'').trim(),text:(card?.innerText||a.innerText||'').trim(),activityText:(card?.innerText||'').match(/(?:在线|刚刚活跃|今日活跃|今天活跃|三日内活跃|本周活跃|本月活跃|\\d+[天周月]内活跃)/)?.[0]||''}}).filter(x=>x.title)})`);
-    const result = JSON.parse(raw || '{}');
-    if (result.security) throwSecurity('搜索页进入安全验证', `${query} 第${page}页`);
-    const unique = new Map((result.links || []).map(x => [jobIdOf(x.url), x]).filter(([id]) => id));
-    if (!unique.size) throw new Error('搜索页没有可读取岗位，按空结果停止，不继续翻页');
-    let fresh = 0;
-    const counts = { priority: 0, review: 0, reject: 0 };
-    for (const [id, link] of unique) {
-      const existed = ledger.jobs.some(x => x.jobId === id);
-      const job = ensureJob(ledger, id, link.url);
-      job.sources = [...new Set([...(job.sources || []), `search:${query}`])];
-      const capturedAt = now();
-      job.discovery = {
-        ...job.discovery,
-        firstSeenAt: job.discovery?.firstSeenAt || capturedAt,
-        lastSeenAt: capturedAt,
-        query,
-        page,
-      };
-      const result = preScreenJob(ledger, job, link, requestedProfile);
-      counts[result.status]++;
-      if (!existed) fresh++;
-    }
-    ledger.runs.push({ id: `search-${Date.now()}`, type: 'search', source: query, profile: requestedProfile || 'auto', page, found: unique.size, fresh, counts, at: now() });
-    saveLedger(ledger);
-    console.log(`${query} 第 ${page} 页：${unique.size} 个岗位，新增 ${fresh}；优先 ${counts.priority}，待看 ${counts.review}，预筛淘汰 ${counts.reject}`);
-  } finally {
-    cdp.close();
-    await closeTab(cdp.tabId, PORT);
-  }
-}
-
 async function companyJobs() {
-  const name = process.argv[3] || '';
+const name = positional() || '';
   const ledger = loadLedger();
   const company = ledger.companies.find(x => x.name === name);
   if (!company?.url) throw new Error(`公司池中没有 ${name} 或缺少入口链接`);
@@ -1039,7 +255,7 @@ async function companyJobs() {
     await humanPause(3500, 7000);
     let allJobsUrl = await cdp.eval(`(()=>{const a=[...document.querySelectorAll('a')].find(x=>/查看(全部|所有)职位/.test((x.innerText||'').trim()));return a?.href||''})()`);
     if (allJobsUrl) { await cdp.navigate(allJobsUrl); await humanPause(3000, 6500); }
-    const raw = await cdp.eval(`JSON.stringify({url:location.href,security:location.href.includes('security_check')||!!document.querySelector('.security-check,.verify-wrap,.captcha'),links:[...document.querySelectorAll('a[href*="/job_detail/"]')].map(a=>({url:a.href,text:(a.innerText||'').trim()})).filter(x=>x.text)})`);
+    const raw = await cdp.eval(`JSON.stringify({url:location.href,security:${SECURITY_JS_EXPR},links:[...document.querySelectorAll('a[href*="/job_detail/"]')].map(a=>({url:a.href,text:(a.innerText||'').trim()})).filter(x=>x.text)})`);
     const page = JSON.parse(raw || '{}');
     if (page.security) throwSecurity('公司职位页进入安全验证', name);
     const unique = new Map((page.links || []).map(x => [jobIdOf(x.url), x]).filter(([id]) => id));
@@ -1062,42 +278,40 @@ async function companyJobs() {
 function list() {
   const ledger = loadLedger();
   const ready = ledger.jobs.filter(x =>
-    ['remote', 'pay', 'risk'].every(k => x.review?.[k]?.status === 'pass') &&
+    REVIEW_FIELDS.every(k => x.review?.[k]?.status === 'pass') &&
     x.outreach?.status === 'not_sent' &&
     !priorContactReason(ledger, x)
   );
   const replies = ledger.conversations.filter(x => x.status === 'needs_reply');
   const review = ledger.conversations.filter(x => x.status === 'boss_last_review');
   const pre = Object.fromEntries(['priority', 'review', 'reject'].map(status => [status, ledger.jobs.filter(x => x.preScreen?.status === status).length]));
-  console.log(`岗位 ${ledger.jobs.length}｜完整JD ${ledger.jobs.filter(x => x.jd?.status === 'read').length}｜预筛优先 ${pre.priority}｜预筛待看 ${pre.review}｜预筛淘汰 ${pre.reject}｜可发送 ${ready.length}｜待回复 ${replies.length}｜待判断 ${review.length}｜远程友好公司 ${ledger.companies.filter(x => x.status === 'pass').length}`);
-  ready.slice(0, 20).forEach(x => console.log(`- [可发送] ${x.jobId} ${x.title} @ ${x.company}`));
-}
-
-function profiles() {
-  for (const [id, profile] of Object.entries(PROFILES)) {
-    console.log(`${id}\t${profile.label}\t${profile.titleKeywords.join('、')}`);
+  console.log(`岗位 ${ledger.jobs.length}｜完整JD ${ledger.jobs.filter(x => x.jd?.status === 'read').length}｜预筛优先 ${pre.priority}｜预筛待看 ${pre.review}｜预筛淘汰 ${pre.reject}｜可发送 ${ready.length}｜待回复 ${replies.length}｜待判断 ${review.length}｜已关注公司 ${ledger.companies.filter(x => x.status === 'pass').length}`);
+  const limit = Math.min(100, Number(arg('limit') || 20));
+  const grep = arg('grep');
+  const queue = arg('queue') || 'ready';
+  const awaiting = ledger.jobs.filter(x =>
+    x.jd?.status === 'read' &&
+    x.outreach?.status === 'not_sent' &&
+    REVIEW_FIELDS.some(k => (x.review?.[k]?.status || 'pending') === 'pending') &&
+    !REVIEW_FIELDS.some(k => x.review?.[k]?.status === 'fail') &&
+    !priorContactReason(ledger, x)
+  );
+  let rows = queue === 'review' ? awaiting : ready;
+  const tag = queue === 'review' ? '待审' : '可发送';
+  const remoteRe = /[^。；;\n]{0,20}(远程办公|远程工作|居家办公|在家办公|可远程|纯远程|全职远程|线上办公|不坐班|不用通勤|支持远程)[^。；;\n]{0,20}/;
+  const remoteHits = new Map();
+if (hasFlag('has-remote')) {
+    rows = rows.filter(job => {
+      const match = `${job.title || ''} ${job.jd?.structured?.description || ''}`.match(remoteRe);
+      if (match) remoteHits.set(job.jobId, match[0].trim());
+      return !!match;
+    });
   }
-}
-
-function rateUsage(ledger) {
-  return Object.fromEntries(Object.keys(RATE_LIMITS).map(kind => {
-    const timestamps = recentTimestamps(ledger, kind);
-    const in24h = countWithin(timestamps, WINDOW_24H);
-    return [kind, {
-      in24h,
-      in10min: countWithin(timestamps, WINDOW_10MIN),
-      remainingUntilSoftLimit: Math.max(0, RATE_LIMITS[kind].softLimit24h - in24h),
-    }];
-  }));
-}
-
-function rateStatus() {
-  const ledger = loadLedger();
-  console.log(JSON.stringify({
-    lock: loadLock(), night: isNightHour(), paceMultiplier: paceMultiplier(),
-    consecutiveEmptyJd: ledger.safety?.consecutiveEmptyJd || 0,
-    used: rateUsage(ledger), limits: RATE_LIMITS,
-  }, null, 2));
+  if (grep) rows = rows.filter(job => new RegExp(grep, 'i').test(`${job.title} ${job.company}`));
+  const source = arg('source');
+  if (source) rows = rows.filter(job => (job.sources || []).some(value => value.includes(source)));
+  console.log(`筛后 ${rows.length}`);
+  rows.slice(0, limit).forEach(job => console.log(`- [${tag}] ${job.jobId} ${job.salary || '薪资未知'} ${job.title} @ ${job.company}${job.opener?.message ? ' [有开场白]' : ''}${remoteHits.has(job.jobId) ? ` ｜远程原句：${remoteHits.get(job.jobId)}` : ''}`));
 }
 
 // 开场自检合并成一条命令：原来要跑 self-test/validate/check/replies/interactions/list/rate-status
@@ -1106,6 +320,7 @@ function rateStatus() {
 async function preflight() {
   const ledger = loadLedger();
   const lock = loadLock();
+  const daily = loadDailyOptions();
   const blocked = lock.locked ? `锁定中：${lock.reason}（${lock.lockedAt}）` : '';
 
   let browser = { ok: false, bossTabs: 0, securityPages: 0 };
@@ -1125,21 +340,26 @@ async function preflight() {
   }
 
   const ready = ledger.jobs.filter(x =>
-    ['remote', 'pay', 'risk'].every(k => x.review?.[k]?.status === 'pass') &&
+    REVIEW_FIELDS.every(k => x.review?.[k]?.status === 'pass') &&
     x.outreach?.status === 'not_sent' &&
     !priorContactReason(ledger, x)
   );
   const needsReadReview = ledger.jobs.filter(x =>
     x.jd?.status === 'read' && x.outreach?.status === 'not_sent' &&
-    !['remote', 'pay', 'risk'].every(k => x.review?.[k]?.status === 'pass') &&
-    !['remote', 'pay', 'risk'].some(k => x.review?.[k]?.status === 'fail')
+    !REVIEW_FIELDS.every(k => x.review?.[k]?.status === 'pass') &&
+    !REVIEW_FIELDS.some(k => x.review?.[k]?.status === 'fail')
   );
 
   console.log(JSON.stringify({
     blocked: blocked || undefined,
+    readiness: {
+      jobWorkflow: !blocked && browser.ok ? 'ready' : 'blocked',
+      autoResume: daily.needsChoice ? 'choice_required_non_blocking' : 'policy_recorded_not_implemented',
+    },
+    dailyOptions: daily,
     browser,
-    rate: { night: isNightHour(), paceMultiplier: paceMultiplier(), used: rateUsage(ledger) },
-    consecutiveEmptyJd: ledger.safety?.consecutiveEmptyJd || 0,
+    rate: { night: isNightHour(), paceMultiplier: paceMultiplier(), used: rateUsage() },
+    consecutiveEmptyJd: loadBudget().consecutiveEmptyJd || 0,
     ledger: {
       jobs: ledger.jobs.length,
       completeJd: ledger.jobs.filter(x => x.jd?.status === 'read').length,
@@ -1196,7 +416,7 @@ async function sendMessage(url, message) {
   }
 
   // 静态去重命中时不联网、不占速率闸门；真要发才计入 sends
-  await guardRate('sends', ledger);
+  await reserveAction('sends', `${id} ${job.title}`, BUDGET_FILE, ['jobReads']);
   const { openTab, closeTab } = cdpLib();
   const cdp = await openTab(url, PORT);
   try {
@@ -1293,11 +513,23 @@ async function sendMessage(url, message) {
       const button=[...document.querySelectorAll('button,a')].find(x=>x.offsetParent&&!x.disabled&&(x.innerText||'').trim()==='发送');
       if(!button)return {error:'send-button'};
       button.click();
-      await new Promise(r=>setTimeout(r,2200));
-      const rows=[...document.querySelectorAll('.last-msg')].filter(x=>(x.querySelector('.last-msg-text')?.innerText||'').trim()===msg);
-      const row=rows.at(-1);
-      const state=row?.querySelector('.message-status');
-      return {inputEmpty:(input.innerText||'').trim()==='',exactMessageCount:rows.length,sameRowStatus:(state?.innerText||'').trim(),sameRowStatusClass:String(state?.className||''),companyVisible:document.body.innerText.includes(${JSON.stringify(job.company || actual.structured.company)})}
+      const targetBossId=${JSON.stringify(liveRecruiter.encryptBossId || '')};
+      const findMatches=()=>{
+        let vm=document.querySelector('.friend-content-warp')?.__vue__;
+        while(vm&&vm.$options?.name!=='virtual-list')vm=vm.$parent;
+        const sources=vm?.$props?.dataSources||vm?.dataSources||[];
+        return targetBossId?sources.filter(s=>s&&String(s.encryptBossId||'')===targetBossId):[];
+      };
+      let matches=[],entry,confirmed=false;
+      for(let attempt=0;attempt<15;attempt++){
+        matches=findMatches();
+        entry=matches[0];
+        confirmed=!!(entry&&entry.lastIsSelf&&(entry.lastText||'').trim()===msg);
+        if(confirmed)break;
+        if(attempt<14)await new Promise(r=>setTimeout(r,1000));
+      }
+      const currentInput=document.querySelector('#chat-input')||input;
+      return {inputEmpty:!currentInput||(currentInput.innerText||'').trim()==='',identityMatchCount:matches.length,matchedText:confirmed,readOrDelivered:confirmed?Number(entry.lastMsgStatus)>=1:false,companyVisible:document.body.innerText.includes(${JSON.stringify(job.company || actual.structured.company)})}
     })()`);
     if (sent && sent.error === 'already-communicated') {
       job.outreach = { status: 'skipped_communicated', message, evidencePath: '', verify: null, target: { title: actual.structured.title, company: actual.structured.company }, sentAt: now() };
@@ -1329,7 +561,7 @@ async function sendMessage(url, message) {
 }
 
 async function send() {
-  const input = process.argv[3] || arg('url');
+  const input = positional() || arg('url');
   const id = jobIdOf(input) || input;
   const ledger = loadLedger();
   const job = ledger.jobs.find(x => x.jobId === id);
@@ -1340,107 +572,57 @@ async function send() {
   return sendMessage(job.url, message);
 }
 
-function showOpenerContext() {
-  const input = process.argv[3] || arg('url');
-  const id = jobIdOf(input) || input;
-  const ledger = loadLedger();
-  const index = ledger.jobs.findIndex(x => x.jobId === id);
-  const job = index >= 0 ? hydrateLegacyStructured(ledger.jobs[index]) : null;
-  if (!job) throw new Error(`台账中没有岗位 ${id}`);
-  ledger.jobs[index] = job;
-  assertAgentReady(ledger, job);
-  console.log(JSON.stringify(openerContext(job, arg('profile'), process.argv.includes('--brief')), null, 2));
-}
-
-function saveOpener() {
-  const input = process.argv[3] || arg('url');
-  const id = jobIdOf(input) || input;
-  const ledger = loadLedger();
-  const index = ledger.jobs.findIndex(x => x.jobId === id);
-  const job = index >= 0 ? hydrateLegacyStructured(ledger.jobs[index]) : null;
-  if (!job) throw new Error(`台账中没有岗位 ${id}`);
-  ledger.jobs[index] = job;
-  assertAgentReady(ledger, job);
-  const message = validateOpener(process.env.MSG || arg('message'));
-  const profileId = matchProfile(job.title, job.jd.structured.description, arg('profile') || job.preScreen?.profile);
-  job.opener = { status: 'generated', message, profile: profileId, jdHash: job.jd.hash, generatedAt: now(), generator: 'host-agent' };
-  addDecision(job, 'opener', 'pass', 'agent_generated', `当前 Agent 已按${PROFILES[profileId]?.label || '用户方向'}生成并通过事实门禁`, message);
-  saveLedger(ledger);
-  console.log(`OPENER_SAVED ${id} ${message}`);
-}
-
-function review() {
-  const id = process.argv[3] || '';
-  const ledger = loadLedger();
-  const job = ledger.jobs.find(x => x.jobId === id);
-  if (!job) throw new Error(`台账中没有岗位 ${id}`);
-  for (const field of ['remote', 'pay', 'risk']) {
-    const status = arg(field);
-    if (!status) continue;
-    if (!['pending', 'pass', 'fail'].includes(status)) throw new Error(`${field} 只能是 pending/pass/fail`);
-    const evidence = arg(`${field}-evidence`) || job.review[field]?.evidence || '';
-    if (status !== 'pending' && !String(evidence).trim()) throw new Error(`${field} 为 ${status} 时必须提供证据`);
-    job.review[field] = { status, evidence };
-    addDecision(job, `jd_${field}`, status === 'fail' ? 'reject' : status, `${field}_review`, `${field} 审核为 ${status}`, evidence);
-  }
-  if (arg('next')) job.nextAction = arg('next');
-  saveLedger(ledger);
-  console.log(`${id}: remote=${job.review.remote.status}, pay=${job.review.pay.status}, risk=${job.review.risk.status}`);
-}
-
-function company() {
-  const name = process.argv[3] || '';
-  if (!name) throw new Error('缺少公司名');
-  const ledger = loadLedger();
-  const existing = ledger.companies.find(x => x.name === name) || { name };
-  Object.assign(existing, { status: arg('status') || existing.status || 'pending', evidence: arg('evidence') || existing.evidence || '', url: arg('url') || existing.url || '', checkedAt: now() });
-  if (!ledger.companies.includes(existing)) ledger.companies.push(existing);
-  saveLedger(ledger);
-  console.log(`${name}: ${existing.status}`);
-}
-
 async function verifyDelivery() {
-  const input = process.argv[3] || arg('url');
+  const input = positional() || arg('url');
   const id = jobIdOf(input) || input;
   const ledger = loadLedger();
-  const job = ledger.jobs.find(x => x.jobId === id);
+  const index = ledger.jobs.findIndex(x => x.jobId === id);
+  const job = index >= 0 ? hydrateLegacyStructured(ledger.jobs[index]) : null;
   if (!job) throw new Error(`台账中没有岗位 ${id}`);
-  if (job.outreach?.status !== 'delivery_unverified' && job.outreach?.status !== 'delivered') throw new Error(`岗位状态为 ${job.outreach?.status}，不能执行送达补录核验`);
+  ledger.jobs[index] = job;
+  if (job.outreach?.status !== 'delivery_unverified' || !job.outreach.message) throw new Error('只允许复核 delivery_unverified 且保留原消息的岗位');
   const { openTab, closeTab } = cdpLib();
-  const cdp = await openTab(`https://www.zhipin.com/web/geek/chat`, PORT);
+  await reserveAction('jobReads', `verify-delivery ${id}`);
+  const cdp = await openTab(job.url, PORT);
   try {
     await humanPause(3500, 7000);
-    const raw = await cdp.eval(`(()=>{
-      const list = [...document.querySelectorAll('.friend-list-item')];
-      const match = list.find(x => (x.innerText||'').includes(${JSON.stringify(job.company)}));
-      if (!match) return { error: '未找到公司会话' };
-      match.click();
-      return { ok: true };
-    })()`);
-    if (raw?.error) throw new Error(raw.error);
-    await humanPause(1600, 2800);
-    const msg = job.outreach.message;
-    const sent = await cdp.eval(`(async()=>{
-      const msg=${JSON.stringify(msg)};
-      const rows=[...document.querySelectorAll('.item-myself')].filter(x=>(x.querySelector('.text')?.innerText||'').trim()===msg);
-      const row=rows.at(-1);
-      const state=row?.querySelector('.status');
-      return {inputEmpty:true, exactMessageCount:rows.length, sameRowStatus:(state?.innerText||'').trim(), sameRowStatusClass:String(state?.className||''), companyVisible:document.body.innerText.includes(${JSON.stringify(job.company)})}
-    })()`);
+    const page = JSON.parse(await cdp.eval(jobPageExpression()) || '{}');
+    if (page.security) throwSecurity('送达复核页进入安全验证', `${id} ${job.url}`);
+    if (isClosedJobText(page.bodyText)) throw new Error('岗位已关闭，无法复核送达');
+    const entered = await cdp.eval(`(()=>{const b=document.querySelector('.btn-startchat');if(!b)return false;b.click();return true})()`);
+    if (!entered) throw new Error('无法进入已有聊天页复核送达');
+    let chatReady = false;
+    for (let i = 0; i < 20; i++) {
+      await humanPause(800, 1400);
+      const probe = await cdp.eval(`({input:!!document.querySelector('#chat-input'),chat:location.href.includes('/web/geek/chat')})`);
+      if (probe?.input && probe.chat) { chatReady = true; break; }
+    }
+    if (!chatReady) throw new Error('聊天页未就绪，未重发');
+    const sent = await cdp.eval(buildDeliveryVerifyExpr(
+      JSON.stringify(job.outreach.message),
+      JSON.stringify(job.recruiter?.encryptBossId || ''),
+      JSON.stringify(job.company),
+    ));
     const verify = sentVerification(sent);
-    if (!Object.values(verify).every(Boolean)) throw new Error(`送达核验失败：${JSON.stringify({ sent, verify })}`);
-    job.outreach.status = 'delivered';
-    job.outreach.verify = verify;
-    addDecision(job, 'delivery', 'pass', 'delivered', '人工发起的送达核验成功', msg);
+    if (Object.values(verify).every(Boolean)) {
+      job.outreach = { ...job.outreach, status: 'delivered', verify, target: { title: job.title, company: job.company } };
+      job.nextAction = '等待回复';
+      addDecision(job, 'delivery', 'pass', 'delivery_verified_late', '延迟复核确认同一完整消息已送达或已读，未重发', job.outreach.message);
+      saveLedger(ledger);
+      console.log(`DELIVERED_LATE ${id} ${job.title} @ ${job.company}`);
+      return;
+    }
+    job.nextAction = '送达仍待确认，禁止重发';
+    addDecision(job, 'delivery', 'pending', 'delivery_still_unverified', JSON.stringify({ sent, verify }), job.outreach.message);
     saveLedger(ledger);
-    console.log(`VERIFIED_DELIVERY ${id}`);
+    console.log(`UNVERIFIED ${id} ${JSON.stringify(verify)}`);
   } finally {
     cdp.close();
     await closeTab(cdp.tabId, PORT);
   }
 }
 
-async function selfTest() {
+async function selfTest({ quiet = false } = {}) {
   PREFERENCES.opener = { ...PREFERENCES.opener, bannedClaims: ['多年经验'] };
   PROFILES['test_mock'] = { label: 'Test', titleKeywords: ['TestTitle'], jdKeywords: ['TestJD'] };
   const firstProfileId = 'test_mock';
@@ -1452,47 +634,50 @@ async function selfTest() {
   assert.equal(assessRemote('非远程', '现场办公').status, 'fail');
   assert.equal(assessRemote('可居家', '').status, 'pass');
   assert.equal(assessRemote('非远程', '支持远程').status, 'pass');
-  assert.equal(matchSecurityPage('security_check'), true);
+  assert.equal(assessRemote('远程诊断测试工程师', '负责 HIL 台架测试').status, 'pending');
+  assert.equal(assessRemote('远程诊断测试工程师', '支持远程办公').status, 'pass');
+  assert.equal(matchSecurityPage('https://www.zhipin.com/web/geek/jobs?_security_check=1_123'), false);
   assert.equal(matchSecurityPage('/403.html'), true);
+  assert.equal(matchSecurityPage('/web/passport/zp/403.html?code=32'), true);
   assert.equal(matchSecurityPage('正常'), false);
   assert.match(unreadableJobMessage({bodyText: '登录查看完整内容'}), /登录态失效/);
   assert.match(unreadableJobMessage({bodyText: '正常'}), /JD 正文在 12 秒内未渲染/);
 
   // ── 24 小时滚动速率闸门 ──
   const stamp = minutesAgo => new Date(Date.now() - minutesAgo * 60000).toISOString();
-  const ledgerWithReads = n => ({ jobs: Array.from({ length: n }, (_, i) => ({ jobId: `j${i}`, jd: { checkedAt: stamp(60 + i) } })) });
-
-  // 25 小时前的读取必须滑出 24 小时窗口，不能一直累加
-  const rolled = ledgerWithReads(3);
-  rolled.jobs.push({ jobId: 'old', jd: { checkedAt: stamp(25 * 60) } });
-  assert.equal(countWithin(recentTimestamps(rolled, 'jobReads'), WINDOW_24H), 3);
-
-  // 旧版按自然日归零的漏洞回归：昨晚 23:00 和今天 00:30 只隔 90 分钟，必须算进同一个窗口
-  const acrossMidnight = { jobs: [{ jobId: 'a', outreach: { sentAt: stamp(90) } }, { jobId: 'b', outreach: { sentAt: stamp(30) } }] };
-  assert.equal(countWithin(recentTimestamps(acrossMidnight, 'sends'), WINDOW_24H), 2);
-
-  // 24 小时软上限用完 → 拒绝（不写熔断锁，只是等窗口滑出）
-  await assert.rejects(() => guardRate('searchPages', { runs: Array.from({ length: RATE_LIMITS.searchPages.softLimit24h }, (_, i) => ({ type: 'search', at: stamp(60 + i) })) }), /24 小时滚动额度已用完/);
-
-  // 10 分钟突发上限 → 拒绝（总量远没到 24 小时上限，纯粹是密度太高）
-  const burstLedger = { jobs: Array.from({ length: RATE_LIMITS.jobReads.burstLimit10min }, (_, i) => ({ jobId: `b${i}`, jd: { checkedAt: stamp(i * 0.1) } })) };
-  await assert.rejects(() => guardRate('jobReads', burstLedger), /10 分钟突发上限/);
-
-  // 24 小时硬顶 → 写入熔断锁（用临时锁文件，不能碰真实 data/lock.json）
+  const tmpBudgetFile = path.join(os.tmpdir(), `bossmate-selftest-budget-${process.pid}.json`);
   const tmpLockFile = path.join(os.tmpdir(), `bossmate-selftest-lock-${process.pid}.json`);
-  const overCeiling = { jobs: Array.from({ length: RATE_LIMITS.jobReads.hardCeiling24h }, (_, i) => ({ jobId: `c${i}`, jd: { checkedAt: stamp(i * 0.01) } })) };
-  await assert.rejects(() => guardRate('jobReads', overCeiling, { lockFile: tmpLockFile }), /触到平台硬顶/);
-  assert.equal(loadLock(tmpLockFile).locked, true);
-  fs.rmSync(tmpLockFile, { force: true });
 
-  // 间隔不够只等待、不报错：临时把间隔调小以免拖慢自测，验证真的会等待而不是直接放行或抛错
+  const writeBudgetEvents = events => fs.writeFileSync(tmpBudgetFile, JSON.stringify({ port: PORT, consecutiveEmptyJd: 0, events }));
+  writeBudgetEvents([{ kind: 'jobReads', at: stamp(5) }, { kind: 'jobReads', at: stamp(60) }, { kind: 'jobReads', at: stamp(23 * 60) }, { kind: 'jobReads', at: stamp(25 * 60) }]);
+  assert.equal(budgetCountWithin(loadBudget(tmpBudgetFile), 'jobReads', WINDOW_24H), 3);
+  assert.equal(budgetCountWithin(loadBudget(tmpBudgetFile), 'jobReads', WINDOW_10MIN), 1);
+
+  writeBudgetEvents(Array.from({ length: RATE_LIMITS.searchPages.softLimit24h }, (_, i) => ({ kind: 'searchPages', at: stamp(60 + i) })));
+  await assert.rejects(() => reserveAction('searchPages', 'self-test', tmpBudgetFile, [], tmpLockFile), /24 小时滚动额度已用完/);
+
+  writeBudgetEvents(Array.from({ length: RATE_LIMITS.jobReads.burstLimit10min }, (_, i) => ({ kind: 'jobReads', at: stamp(i * 0.1) })));
+  await assert.rejects(() => reserveAction('jobReads', 'self-test', tmpBudgetFile, [], tmpLockFile), /10 分钟突发上限/);
+
+  writeBudgetEvents(Array.from({ length: RATE_LIMITS.jobReads.hardCeiling24h }, (_, i) => ({ kind: 'jobReads', at: stamp(i * 0.01) })));
+  await assert.rejects(() => reserveAction('jobReads', 'self-test', tmpBudgetFile, [], tmpLockFile), /触到平台硬顶/);
+  assert.equal(loadLock(tmpLockFile).locked, true);
+
   const originalGap = RATE_LIMITS.jobReads.minGapMs;
   RATE_LIMITS.jobReads.minGapMs = 50;
-  const justNow = { jobs: [{ jobId: 'z', jd: { checkedAt: new Date().toISOString() } }] };
+  writeBudgetEvents([{ kind: 'jobReads', at: new Date().toISOString() }]);
   const startedAt = Date.now();
-  await guardRate('jobReads', justNow);
+  await reserveAction('jobReads', 'self-test', tmpBudgetFile, [], tmpLockFile);
   assert(Date.now() - startedAt >= 20, '间隔不足时必须实际等待，不能直接放行');
   RATE_LIMITS.jobReads.minGapMs = originalGap;
+
+  writeBudgetEvents([]);
+  await reserveAction('sends', 'self-test', tmpBudgetFile, ['jobReads'], tmpLockFile);
+  const counted = loadBudget(tmpBudgetFile);
+  assert.equal(budgetCountWithin(counted, 'sends', WINDOW_24H), 1);
+  assert.equal(budgetCountWithin(counted, 'jobReads', WINDOW_24H), 1);
+  fs.rmSync(tmpBudgetFile, { force: true });
+  fs.rmSync(tmpLockFile, { force: true });
 
   // 深夜只压节奏、不压总量
   assert.equal(isNightHour(new Date(2026, 0, 1, 23, 30)), true);
@@ -1519,7 +704,24 @@ async function selfTest() {
     assert(field in payload, `reviewPayload 缺少审核所需字段 ${field}`);
   }
   assert.equal(payload.description, '岗位正文内容');
-  assert.deepEqual(payload.review, { remote: 'pending', pay: 'pending', risk: 'pending' });
+  assert.deepEqual(payload.review, { fit: 'pending', location: 'pending', pay: 'pending', risk: 'pending' });
+  const legacyReview = normalizeJob({ jobId: 'legacy-review', review: { remote: { status: 'pass', evidence: '旧版远程记录' } } });
+  assert.deepEqual(legacyReview.review.location, { status: 'pass', evidence: '旧版远程记录' });
+
+  const originalRequirements = { ...PREFERENCES.requirements };
+  PREFERENCES.requirements.remotePolicy = '';
+  const preScreenLedger = { jobs: [], conversations: [] };
+  const noRemoteJob = blankJob('prescreen-no-remote');
+  noRemoteJob.title = '软件开发';
+  assert.equal(preScreenJob(preScreenLedger, noRemoteJob, { title: '软件开发', text: '软件开发岗位' }, 'primary').status, 'priority');
+  PREFERENCES.requirements.remotePolicy = '仅远程';
+  const remoteUnknownJob = blankJob('prescreen-remote-unknown');
+  remoteUnknownJob.title = '软件开发';
+  assert.equal(preScreenJob(preScreenLedger, remoteUnknownJob, { title: '软件开发', text: '软件开发岗位' }, 'primary').status, 'review');
+  const remoteHintJob = blankJob('prescreen-remote-hint');
+  remoteHintJob.title = '软件开发';
+  assert.equal(preScreenJob(preScreenLedger, remoteHintJob, { title: '软件开发', text: '软件开发岗位，支持远程办公' }, 'primary').status, 'priority');
+  Object.assign(PREFERENCES.requirements, originalRequirements);
 
   // --brief 必须去掉重复的 JD 正文和事实档案，且不能因此丢掉写开场白必需的字段
   PROFILES['brief_mock'] = { label: 'Brief', titleKeywords: ['岗位标题'], jdKeywords: [], factFocus: '选最相关的一项' };
@@ -1544,8 +746,22 @@ async function selfTest() {
 
   assert.equal(conversationStatus({ lastMessage: '暂时不考虑远程亲' }), 'closed');
   assert.equal(conversationStatus({ lastMessage: '可以先看下样片嘛' }), 'needs_reply');
-  assert.deepEqual(sentVerification({ inputEmpty: true, exactMessageCount: 1, sameRowStatusClass: 'message-status status-delivery', companyVisible: true }), { inputEmpty: true, exactMessage: true, sameRowDelivered: true, companyVisible: true });
-  assert.equal(Object.values(sentVerification({ inputEmpty: true, exactMessageCount: 2, sameRowStatusClass: 'status-delivery', companyVisible: true })).every(Boolean), false);
+  assert.equal(conversationStatus({ lastMessage: '' }), 'needs_inspect');
+  assert.equal(conversationStatus({ lastMessage: '您的附件简历已发送给Boss' }), 'system_notice');
+  assert.equal(resumeTrigger('麻烦发一份附件简历'), 'explicit');
+  assert.equal(resumeTrigger('暂时不用发简历'), 'declined');
+  assert.deepEqual(
+    sentVerification({ inputEmpty: true, identityMatchCount: 1, matchedText: true, readOrDelivered: true, companyVisible: true }),
+    { inputEmpty: true, identityMatched: true, delivered: true, companyVisible: true },
+  );
+  assert.equal(Object.values(sentVerification({ inputEmpty: true, identityMatchCount: 0, matchedText: false, readOrDelivered: false, companyVisible: true })).every(Boolean), false);
+  assert.equal(isExpiredJobRedirect('https://www.zhipin.com/'), true);
+  assert.equal(isExpiredJobRedirect('https://www.zhipin.com/web/geek/jobs'), true);
+  assert.equal(isExpiredJobRedirect('https://www.zhipin.com/web/passport/login'), false);
+  assert.equal(isExpiredJobRedirect('https://evil.example.com/'), false);
+  const hashBase = { title: '岗位', company: '公司', description: '正文', benefits: '五险一金、年终奖' };
+  assert.equal(jdHashOf(hashBase), jdHashOf({ ...hashBase, benefits: '年终奖 五险一金' }));
+  assert.notEqual(jdHashOf(hashBase), jdHashOf({ ...hashBase, benefits: '五险一金' }));
   const sameBoss = { version: 1, jobs: [], conversations: [{ encryptBossId: 'boss-a', encryptJobId: 'old-job', company: '甲公司', name: '张三' }] };
   assert.match(priorContactReason(sameBoss, { jobId: 'new-job', recruiter: { encryptBossId: 'boss-a', company: '甲公司', name: '张三' } }), /招聘者/);
   assert.equal(priorContactReason(sameBoss, { jobId: 'new-job', recruiter: { encryptBossId: 'boss-b', company: '甲公司', name: '李四' } }), '');
@@ -1579,26 +795,66 @@ async function selfTest() {
   assert.throws(() => assertReadableDescription('   '), /JD 正文为空/);
   const ready = blankJob('ready');
   ready.jd = { status: 'read', structured: { description: '完整岗位正文', incomplete: false } };
-  ready.review = { remote: { status: 'pass' }, pay: { status: 'pass' }, risk: { status: 'pass' } };
+  ready.review = Object.fromEntries(REVIEW_FIELDS.map(field => [field, { status: 'pass' }]));
   assert.doesNotThrow(() => assertSendReady(ready));
-  console.log('SELF_TEST_OK');
+  if (!quiet) console.log('SELF_TEST_OK');
+  return { ok: true };
+}
+
+async function doctor() {
+  const checks = [];
+  const run = async (name, fn) => {
+    try {
+      const detail = await fn();
+      checks.push({ name, ok: true, ...(detail === undefined ? {} : { detail }) });
+    } catch (error) {
+      checks.push({ name, ok: false, error: String(error.message || error) });
+    }
+  };
+  await run('node', () => ({ version: process.version, supported: Number(process.versions.node.split('.')[0]) >= 22 }));
+  await run('modules', () => {
+    const modules = ['cdp', 'runtime-config', 'cli-args', 'ledger-store', 'job-domain', 'jd-domain', 'opener-service', 'delivery-verification', 'conversation-domain', 'daily-options', 'workbench', 'offline-commands', 'discovery-sources', 'page-flows', 'maintenance', 'safety', 'command-help'];
+    modules.forEach(name => require(`./${name}`));
+    return { loaded: modules.length };
+  });
+  await run('help-coverage', () => {
+    const missing = Object.keys(commands).filter(name => !HELP[name]);
+    const stale = Object.keys(HELP).filter(name => !commands[name]);
+    if (missing.length || stale.length) throw new Error(`缺帮助=${missing.join(',') || '无'}；失效帮助=${stale.join(',') || '无'}`);
+    return { commands: Object.keys(commands).length, online: ONLINE_COMMANDS.size };
+  });
+  await run('workspace', () => ({ configured: fs.existsSync(PREFERENCES_FILE) && fs.existsSync(FACTS_FILE), root: ROOT }));
+  await run('ledger', () => validate({ quiet: true }));
+  await run('self-test', () => selfTest({ quiet: true }));
+  const ok = checks.every(check => check.ok && (check.name !== 'node' || check.detail.supported));
+  console.log(JSON.stringify({ ok, mode: 'offline', consumesBossBudget: false, checks }, null, 2));
+  if (!ok) process.exitCode = 1;
 }
 
 const commands = {
-  import: importLegacy, validate, check, preflight, replies, interactions, profile, profiles, search, candidates,
-  read: readJob, jd: showJd, review, 'opener-context': showOpenerContext, 'save-opener': saveOpener, send,
+  import: importLegacy, 'migrate-jd': migrateJd, 'rehash-jd': rehashJd, validate, check, preflight, 'daily-options': dailyOptions,
+  'next-work': nextWork, 'job-workbench': jobWorkbench, 'review-audit': reviewAudit,
+  'job-sources': jobSources, search, 'search-next': searchNext, 'search-close': searchClose,
+  favorites, 'favorites-next': favoritesNext, 'favorite-status': favoriteStatus, 'favorite-queue': favoriteQueue,
+  recommendations, 'recommendations-next': recommendationsNext, 'recommendations-close': recommendationsClose,
+  replies, interactions, profile, profiles, search, candidates,
+  read: readJob, jd: showJd, review, 'opener-context': showOpenerContext, 'save-opener': saveOpener, 'discard-opener': discardOpener, send,
   company, 'company-jobs': companyJobs, list, 'self-test': selfTest, unlock, 'verify-delivery': verifyDelivery,
-  'rate-status': rateStatus,
+  'rate-status': rateStatus, budget: rateStatus, doctor,
 };
 const command = process.argv[2];
+if (command === 'help' || command === '--help' || process.argv.includes('--help')) {
+  help(command === 'help' ? (process.argv[3] || '') : '');
+  process.exit(0);
+}
 if (!commands[command]) {
-  console.log('用法: node scripts/boss.js <preflight|check|replies|interactions|profile|profiles|search|candidates|read|jd|review|opener-context|save-opener|send|verify-delivery|company|company-jobs|list|rate-status|import|validate|self-test|unlock>');
+  help();
   process.exit(command ? 1 : 0);
 }
 if (['check', 'replies', 'interactions', 'profile', 'search', 'read', 'review', 'opener-context', 'save-opener', 'send', 'verify-delivery', 'company', 'company-jobs'].includes(command)) {
   assertConfigured();
-  assertNotLocked();
 }
+if (ONLINE_COMMANDS.has(command)) assertNotLocked();
 // preflight 自己就要负责报告"是否被锁"，所以不能被锁挡在门外；
 // jd 是纯离线复看，上下文被压缩后正需要它在锁定期间也能取回正文。
 if (['preflight', 'jd'].includes(command)) assertConfigured();

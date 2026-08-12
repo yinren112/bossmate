@@ -3,6 +3,7 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { parseCliArgs, positionals } = require('./cli-args');
 const { spawnSync } = require('child_process');
 
 const root = path.resolve(__dirname, '..');
@@ -17,6 +18,11 @@ function run(script, args = [], extraEnv = {}) {
 }
 
 try {
+  assert.deepEqual(positionals(['--profile=frontend', 'fixture-job', '--brief']), ['fixture-job']);
+  assert.deepEqual(parseCliArgs(['--profile', 'frontend', 'fixture-job', '--brief']), {
+    options: { profile: 'frontend' }, flags: new Set(['brief']), positionals: ['fixture-job'],
+  });
+
   let result = run('setup.js', [`--home=${home}`]);
   assert.equal(result.status, 0, result.stderr);
   assert(fs.existsSync(path.join(home, 'profile.md')));
@@ -39,6 +45,14 @@ try {
   const preferencesFile = path.join(home, 'preferences.json');
   const preferences = JSON.parse(fs.readFileSync(preferencesFile, 'utf8'));
   preferences.onboarding = { confirmed: true, confirmedAt: new Date().toISOString() };
+  preferences.profiles = {
+    primary: {
+      label: '测试目标岗位',
+      titleKeywords: ['软件开发'],
+      jdKeywords: ['开发', '测试', '交付'],
+      factFocus: '从已确认事实中选择最相关的一项'
+    }
+  };
   fs.writeFileSync(preferencesFile, JSON.stringify(preferences, null, 2) + '\n');
   fs.writeFileSync(path.join(home, 'profile.md'), '# Confirmed facts\n\n- Built and shipped one real software project.\n');
 
@@ -70,6 +84,7 @@ try {
       }
     },
     review: {
+      fit: { status: 'pending', evidence: '' },
       remote: { status: 'pending', evidence: '' },
       pay: { status: 'pending', evidence: '' },
       risk: { status: 'pending', evidence: '' }
@@ -88,6 +103,33 @@ try {
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /SELF_TEST_OK/);
 
+  result = run('boss.js', ['doctor']);
+  assert.equal(result.status, 0, result.stderr);
+  const doctor = JSON.parse(result.stdout);
+  assert.equal(doctor.ok, true);
+  assert.equal(doctor.mode, 'offline');
+  assert.equal(doctor.consumesBossBudget, false);
+
+  result = run('boss.js', ['help', 'job-workbench']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /单个岗位完整状态/);
+
+  result = run('boss.js', ['daily-options']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).needsChoice, true);
+  result = run('boss.js', ['daily-options', '--resume=explicit']);
+  assert.equal(result.status, 0, result.stderr);
+  const dailyOptions = JSON.parse(result.stdout);
+  assert.equal(dailyOptions.resumeMode, 'explicit');
+  assert.equal(dailyOptions.automaticSendingImplemented, false);
+
+  result = run('boss.js', ['rehash-jd']);
+  assert.equal(result.status, 0, result.stderr);
+  const rehashResult = JSON.parse(result.stdout);
+  assert.equal(rehashResult.rehashed, 1);
+  const rehashedLedger = JSON.parse(fs.readFileSync(ledgerFile, 'utf8'));
+  assert.notEqual(rehashedLedger.jobs[0].jd.hash, 'fixture-hash');
+
   // jd：离线取回审核所需的全部字段（含正文），让 agent 永远不必去读 ledger.json
   result = run('boss.js', ['jd', 'fixture-job']);
   assert.equal(result.status, 0, result.stderr);
@@ -99,11 +141,23 @@ try {
 
   result = run('boss.js', [
     'review', 'fixture-job',
+    '--fit=pass', '--fit-evidence=目标软件开发方向且职责匹配已确认事实',
     '--remote=pass', '--remote-evidence=支持远程办公',
     '--pay=pass', '--pay-evidence=100-150元/时',
     '--risk=pass', '--risk-evidence=未发现用户配置的风险'
   ]);
   assert.equal(result.status, 0, result.stderr);
+  const reviewedLedger = JSON.parse(fs.readFileSync(ledgerFile, 'utf8'));
+  assert.equal(reviewedLedger.jobs[0].review.location.status, 'pass', '旧版 --remote 命令应写入新版地点审核');
+  assert.equal('remote' in reviewedLedger.jobs[0].review, false, '台账应清洗为新版地点审核字段');
+
+  result = run('boss.js', ['job-workbench', 'fixture-job']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).next.stage, 'opener');
+
+  result = run('boss.js', ['review-audit']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).count, 0);
 
   result = run('boss.js', ['opener-context', 'fixture-job']);
   assert.equal(result.status, 0, result.stderr);
@@ -124,6 +178,10 @@ try {
   result = run('boss.js', ['save-opener', 'fixture-job'], { MSG: message });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /OPENER_SAVED/);
+
+  result = run('boss.js', ['next-work']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).next.stage, 'send');
 
   result = run('boss.js', ['validate']);
   assert.equal(result.status, 0, result.stderr);

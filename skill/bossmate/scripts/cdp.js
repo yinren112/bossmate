@@ -1,113 +1,197 @@
-// Minimal Chrome DevTools Protocol client for a user-controlled, logged-in browser.
-// Requires Node.js 22+ for the built-in WebSocket implementation.
+// 仅使用 Node.js 22+ 自带 WebSocket 的裸 CDP 客户端。
 const http = require('http');
 
-function httpJson(url) {
+const DEFAULT_PORT = Number(process.env.BOSS_CDP_PORT || 9222);
+
+function request(method, requestPath, port = DEFAULT_PORT) {
   return new Promise((resolve, reject) => {
-    http.get(url, r => { let d = ''; r.on('data', c => d += c); r.on('end', () => { try { resolve(JSON.parse(d)); } catch (e) { reject(e); } }); }).on('error', reject);
+    const req = http.request({ host: '127.0.0.1', port, path: requestPath, method }, response => {
+      let body = '';
+      response.setEncoding('utf8');
+      response.on('data', chunk => { body += chunk; });
+      response.on('end', () => {
+        if (response.statusCode >= 400) {
+          reject(new Error(`CDP HTTP ${response.statusCode}: ${body.slice(0, 300)}`));
+          return;
+        }
+        resolve(body);
+      });
+    });
+    req.setTimeout(10000, () => req.destroy(new Error('CDP HTTP timeout')));
+    req.on('error', reject);
+    req.end();
   });
 }
 
-class CDP {
-  constructor(port = 9222) { this.port = port; this.ws = null; this.id = 0; this.pending = new Map(); }
+async function httpJson(url) {
+  const parsed = new URL(url);
+  return JSON.parse(await request('GET', `${parsed.pathname}${parsed.search}`, Number(parsed.port || DEFAULT_PORT)));
+}
 
-  // 连到当前打开的目标站点页面（不新建标签，复用现有登录态页面）。
-  // match 默认匹配 zhipin（BOSS）；多平台采集可传字符串(includes)或函数(t=>bool)。
+const sleep = ms => new Promise(resolve => setTimeout(resolve, Math.max(0, ms)));
+
+class CDP {
+  constructor(port = DEFAULT_PORT) {
+    this.port = port;
+    this.ws = null;
+    this.id = 0;
+    this.pending = new Map();
+    this.page = null;
+    this.tabId = '';
+  }
+
   async connectPage(match = 'zhipin.com') {
-    const tabs = await httpJson(`http://127.0.0.1:${this.port}/json`);
-    const test = typeof match === 'function' ? match : (t => (t.url || '').includes(match));
-    const page = tabs.find(t => t.type === 'page' && test(t));
-    if (!page) throw new Error(`未找到匹配的已打开页面（match=${typeof match === 'function' ? 'fn' : match}）。先确认 19222 上的 Chrome 已打开对应站点并登录。`);
-    await new Promise((res, rej) => {
-      this.ws = new WebSocket(page.webSocketDebuggerUrl);
-      this.ws.addEventListener('open', res, { once: true });
-      this.ws.addEventListener('error', rej, { once: true });
-      this.ws.addEventListener('message', event => {
-        const msg = JSON.parse(event.data);
-        const cb = this.pending.get(msg.id);
-        if (cb) { this.pending.delete(msg.id); cb(msg); }
-      });
-    });
-    this.page = page;
+    const tabs = await listTabs(this.port);
+    const test = typeof match === 'function' ? match : tab => (tab.url || '').includes(match);
+    const page = tabs.find(test);
+    if (!page) throw new Error(`端口 ${this.port} 未找到匹配页面（${typeof match === 'function' ? '自定义条件' : match}）`);
+    await this.connectTarget(page);
     return page;
   }
 
-  _cmd(method, params) {
-    return new Promise(resolve => {
-      const id = ++this.id;
-      this.pending.set(id, resolve);
-      this.ws.send(JSON.stringify({ id, method, params }));
+  async connectTarget(page) {
+    if (!page?.webSocketDebuggerUrl) throw new Error('CDP 目标缺少 WebSocket 地址');
+    if (this.ws) this.close();
+    const ws = new WebSocket(page.webSocketDebuggerUrl);
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        try { ws.close(); } catch {}
+        reject(new Error('CDP WebSocket connect timeout'));
+      }, 10000);
+      ws.addEventListener('open', () => { clearTimeout(timer); resolve(); }, { once: true });
+      ws.addEventListener('error', () => { clearTimeout(timer); reject(new Error('CDP WebSocket connect failed')); }, { once: true });
+    });
+    ws.addEventListener('message', event => {
+      let message;
+      try { message = JSON.parse(String(event.data)); } catch { return; }
+      if (!message.id) return;
+      const pending = this.pending.get(message.id);
+      if (!pending) return;
+      this.pending.delete(message.id);
+      clearTimeout(pending.timer);
+      if (message.error) pending.reject(new Error(`CDP ${pending.method}: ${message.error.message || JSON.stringify(message.error)}`));
+      else pending.resolve(message.result || {});
+    });
+    ws.addEventListener('close', () => {
+      for (const pending of this.pending.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error(`CDP connection closed during ${pending.method}`));
+      }
+      this.pending.clear();
+    });
+    this.ws = ws;
+    this.page = page;
+    this.tabId = page.id;
+  }
+
+  command(method, params = {}, timeoutMs = 25000) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return Promise.reject(new Error('CDP WebSocket 未连接'));
+    const id = ++this.id;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`CDP ${method} timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+      this.pending.set(id, { resolve, reject, timer, method });
+      try {
+        this.ws.send(JSON.stringify({ id, method, params }));
+      } catch (error) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(error);
+      }
     });
   }
 
-  // 在页面里求值一段 JS（支持 await Promise）。返回 returnByValue 的值。
-  async eval(expr, timeoutMs = 25000) {
-    const cmd = this._cmd('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true });
-    const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('CDP eval timeout')), timeoutMs));
-    const msg = await Promise.race([cmd, timeout]);
-    if (msg.result && msg.result.exceptionDetails) {
-      throw new Error('JS 异常: ' + JSON.stringify(msg.result.exceptionDetails).slice(0, 300));
+  _cmd(method, params = {}) {
+    return this.command(method, params);
+  }
+
+  async eval(expression, timeoutMs = 25000) {
+    const result = await this.command('Runtime.evaluate', {
+      expression, returnByValue: true, awaitPromise: true, userGesture: true,
+    }, timeoutMs);
+    if (result.exceptionDetails) {
+      const detail = result.exceptionDetails.exception?.description || result.exceptionDetails.text || 'unknown exception';
+      throw new Error(`页面 JS 异常: ${detail.slice(0, 500)}`);
     }
-    return msg.result && msg.result.result ? msg.result.result.value : undefined;
+    return result.result?.value;
   }
 
-  // 页面内导航（用 location.href，不需要 enable Page 域）
-  async navigate(url) { await this.eval(`location.href=${JSON.stringify(url)};'ok'`); }
+  async navigate(url) {
+    try {
+      await this.eval(`location.href=${JSON.stringify(url)};'navigating'`);
+    } catch (error) {
+      await sleep(200);
+      const current = await this.eval('location.href').catch(() => '');
+      let reached = false;
+      try {
+        const expectedUrl = new URL(url);
+        const currentUrl = new URL(current);
+        reached = expectedUrl.origin === currentUrl.origin && expectedUrl.pathname === currentUrl.pathname &&
+          [...expectedUrl.searchParams].every(([key, value]) => currentUrl.searchParams.get(key) === value);
+      } catch {}
+      if (!reached) throw error;
+    }
+    return 'navigating';
+  }
 
-  close() { try { this.ws && this.ws.close(); } catch {} }
+  async waitFor(expression, { timeoutMs = 15000, intervalMs = 250, description = '页面条件' } = {}) {
+    const deadline = Date.now() + timeoutMs;
+    let lastValue;
+    let lastError;
+    while (Date.now() < deadline) {
+      try {
+        lastValue = await this.eval(expression, Math.min(5000, Math.max(1000, deadline - Date.now())));
+        if (lastValue) return lastValue;
+      } catch (error) {
+        lastError = error;
+      }
+      await sleep(intervalMs);
+    }
+    const suffix = lastError ? `；最后错误：${lastError.message}` : `；最后结果：${JSON.stringify(lastValue)}`;
+    throw new Error(`等待${description}超时 ${timeoutMs}ms${suffix}`);
+  }
+
+  close() {
+    if (!this.ws) return;
+    try { this.ws.close(); } catch {}
+    this.ws = null;
+  }
 }
 
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-// Bounded jitter prevents synchronized requests. It is not a safety bypass.
-const rnd = (a, b) => {
-  const u = (Math.random() + Math.random() + Math.random()) / 3;
-  let v = a + (b - a) * u;
-  if (Math.random() < 0.05) v += 2000 + Math.random() * 3000;
-  return v;
-};
-
-// ── 浏览器级标签管理（HTTP，不需要 ws）──
-// 实测：被反复导航过、带 _security_check 的旧标签页进聊天会被弹回首页；
-// 用全新标签页打开聊天则稳定不跳。所以发送一律新开标签。
-function _http(method, path, port) {
-  return new Promise((resolve, reject) => {
-    const req = http.request({ host: '127.0.0.1', port, path, method }, r => { let d = ''; r.on('data', c => d += c); r.on('end', () => resolve(d)); });
-    req.on('error', reject); req.end();
-  });
+async function listTabs(port = DEFAULT_PORT) {
+  return (await httpJson(`http://127.0.0.1:${port}/json`)).filter(tab => tab.type === 'page');
 }
-async function openTab(url, port = 9222) {
-  const raw = await _http('PUT', '/json/new?' + encodeURIComponent(url), port);
-  const tab = JSON.parse(raw);
-  await _http('GET', '/json/activate/' + tab.id, port).catch(() => {}); // 尽量前台
+
+async function openTab(url, port = DEFAULT_PORT) {
+  const tab = JSON.parse(await request('PUT', `/json/new?${encodeURIComponent(url)}`, port));
+  await request('GET', `/json/activate/${tab.id}`, port).catch(() => {});
   const cdp = new CDP(port);
-  await new Promise((res, rej) => {
-    cdp.ws = new WebSocket(tab.webSocketDebuggerUrl);
-    cdp.ws.addEventListener('open', res, { once: true });
-    cdp.ws.addEventListener('error', rej, { once: true });
-    cdp.ws.addEventListener('message', event => {
-      const msg = JSON.parse(event.data);
-      const cb = cdp.pending.get(msg.id);
-      if (cb) { cdp.pending.delete(msg.id); cb(msg); }
-    });
-  });
-  cdp.tabId = tab.id;
+  await cdp.connectTarget(tab);
   return cdp;
 }
-function closeTab(tabId, port = 9222) { return _http('GET', '/json/close/' + tabId, port).catch(() => {}); }
 
-// 连到已打开的匹配页面；若一个都没有，则自动新开 fallbackUrl 页面并连上。
-// 省掉"必须先手动开好某站点页面"的前置麻烦（如智联：任意 zhaopin.com 页面都带登录 cookie）。
-// 返回 { cdp, opened }；opened=true 表示是脚本新开的标签，调用方可决定是否收尾 closeTab。
-async function connectOrOpen(match, fallbackUrl, port = 9222) {
-  const tabs = await httpJson(`http://127.0.0.1:${port}/json`);
-  const test = typeof match === 'function' ? match : (t => (t.url || '').includes(match));
-  if (tabs.find(t => t.type === 'page' && test(t))) {
-    const cdp = new CDP(port);
-    await cdp.connectPage(match);
-    return { cdp, opened: false };
-  }
-  const cdp = await openTab(fallbackUrl, port);
-  return { cdp, opened: true };
+async function closeTab(tabId, port = DEFAULT_PORT) {
+  if (!tabId) return false;
+  await request('GET', `/json/close/${encodeURIComponent(tabId)}`, port).catch(() => {});
+  return true;
 }
 
-module.exports = { CDP, httpJson, sleep, rnd, openTab, closeTab, connectOrOpen };
+async function activateTab(tabId, port = DEFAULT_PORT) {
+  await request('GET', `/json/activate/${encodeURIComponent(tabId)}`, port);
+}
+
+async function connectOrOpen(match, fallbackUrl, port = DEFAULT_PORT) {
+  const tabs = await listTabs(port);
+  const test = typeof match === 'function' ? match : tab => (tab.url || '').includes(match);
+  const page = tabs.find(test);
+  if (!page) return { cdp: await openTab(fallbackUrl, port), opened: true };
+  const cdp = new CDP(port);
+  await cdp.connectTarget(page);
+  return { cdp, opened: false };
+}
+
+module.exports = {
+  CDP, DEFAULT_PORT, activateTab, closeTab, connectOrOpen, httpJson, listTabs, openTab, request, sleep,
+};

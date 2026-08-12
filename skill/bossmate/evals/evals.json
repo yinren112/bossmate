@@ -1,0 +1,38 @@
+{
+  "skill_name": "bossmate",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "使用 BossMate 帮一位新用户开始求职。用户只给了一份简历，还没有 preferences.json，也没有登录专用浏览器。请说明你会先做什么。",
+      "expected_output": "先完成私有工作区初始化和用户确认，再配置可见的专用浏览器；不会直接开始在线搜索，也不会把个人资料写进 Skill 目录。",
+      "expectations": [
+        "先读取 onboarding.md 并完成 profile.md 与 preferences.json 的用户确认",
+        "明确登录由用户本人在可见专用浏览器中完成",
+        "未确认配置前不执行在线 BOSS 操作",
+        "个人资料只进入私有工作区"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "继续一个已经积累数千岗位的 BossMate 工作区，先判断今天能做什么。不要浪费上下文，也不要执行在线操作。",
+      "expected_output": "使用 doctor 和离线台账命令了解状态，不直接读取 ledger.json，不调用 preflight、search、read 或其他在线命令。",
+      "expectations": [
+        "运行或建议运行完全离线的 doctor",
+        "不直接读取 data/ledger.json",
+        "只通过 list、jd、validate 等离线入口读取必要信息",
+        "不触发任何在线 BOSS 命令"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "某岗位的开场白文本与另一个会话完全相同，发送后系统无法确认送达。请用 BossMate 排查，不能凭文本相同就认定成功。",
+      "expected_output": "通过 verify-delivery 进入目标岗位会话，用稳定招聘者身份、完整消息行和送达状态联合核验；无法绑定时保留 delivery_unverified。",
+      "expectations": [
+        "使用 verify-delivery 而不是重复发送",
+        "核验绑定目标岗位对应的稳定招聘者身份",
+        "要求完整消息位于本人消息行且显示送达或已读",
+        "证据不足时保持 delivery_unverified"
+      ]
+    }
+  ]
+}

@@ -28,18 +28,9 @@
       "精通"
     ]
   },
-  "profiles": {
-    "primary": {
-      "label": "主要目标岗位",
-      "titleKeywords": [
-        "软件开发"
-      ],
-      "jdKeywords": [
-        "开发",
-        "测试",
-        "交付"
-      ],
-      "factFocus": "从用户已确认事实中选择与 JD 最相关的一项"
-    }
-  }
+  "resumes": {
+    "files": [],
+    "profileMapping": {}
+  },
+  "profiles": {}
 }

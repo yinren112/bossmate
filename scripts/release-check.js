@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 
 const root = path.resolve(__dirname, '..');
-const skipDirs = new Set(['.git', 'node_modules']);
+const skipDirs = new Set(['.git', 'node_modules', 'output']);
 const skipFiles = new Set([
   path.resolve(__filename),
   path.join(root, 'skill', 'bossmate', 'scripts', 'privacy-scan.js'),
@@ -44,7 +44,15 @@ if (hits.length) {
 const required = [
   'README.md', 'LICENSE', 'package.json', 'bin/bossmate.js',
   'skill/bossmate/SKILL.md', 'skill/bossmate/scripts/boss.js',
-  'skill/bossmate/scripts/cdp.js'
+  'skill/bossmate/scripts/cdp.js', 'skill/bossmate/scripts/runtime-config.js',
+  'skill/bossmate/scripts/cli-args.js', 'skill/bossmate/scripts/ledger-store.js',
+  'skill/bossmate/scripts/job-domain.js', 'skill/bossmate/scripts/jd-domain.js',
+  'skill/bossmate/scripts/opener-service.js', 'skill/bossmate/scripts/delivery-verification.js',
+  'skill/bossmate/scripts/conversation-domain.js', 'skill/bossmate/scripts/page-flows.js',
+  'skill/bossmate/scripts/daily-options.js', 'skill/bossmate/scripts/workbench.js',
+  'skill/bossmate/scripts/command-help.js', 'skill/bossmate/scripts/offline-commands.js',
+  'skill/bossmate/scripts/discovery-sources.js',
+  'skill/bossmate/scripts/maintenance.js', 'skill/bossmate/scripts/safety.js'
 ];
 for (const file of required) {
   if (!fs.existsSync(path.join(root, file))) {

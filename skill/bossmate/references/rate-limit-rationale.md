@@ -43,20 +43,17 @@ concurrent ones, because nothing organic produces that little variance.
 
 Every wait in this runtime is drawn from a randomized range. Never replace one with a constant.
 
-## Why counters derive from the ledger
+## Why actions are reserved before the request
 
-The rate counters are computed from timestamps the ledger already stores (`jd.checkedAt` /
-`jd.liveCheckedAt`, `outreach.sentAt`, `runs[].at`) rather than from a dedicated counter file.
+Rate events are persisted in `data/budget.<port>.json` before the browser request starts. A failed
+load, blank JD, security redirect, or interrupted send still reached the platform and must count.
+Deriving counters only from successful ledger writes silently under-counts exactly the failures
+most likely to precede an account restriction.
 
-Two failure modes motivate this:
-
-- **A separate counter file drifts.** It can disagree with what the ledger says actually happened
-  — after a crash, a partial write, or a manual edit — and then the gate is enforcing fiction.
-- **An in-memory counter is worse than none.** Every command here runs as its own process, so a
-  module-level variable resets on every invocation. A "3 consecutive blank JDs" breaker
-  implemented that way never fires even once, while still reading like a working safeguard. That
-  exact bug shipped and survived review; the consecutive-empty-JD count is now persisted in
-  `ledger.safety`.
+On first upgrade, BossMate seeds the budget from existing ledger timestamps. After that, the
+budget is authoritative. It is separated by CDP port so two configured accounts cannot consume or
+clear each other's limits. An in-memory counter is never used because every command runs as a new
+process.
 
 Anything that must survive a restart, a context compaction, or a switch to a different script
 belongs in a file, not in a variable and not in conversation history.

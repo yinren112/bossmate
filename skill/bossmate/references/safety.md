@@ -2,8 +2,9 @@
 
 ## Rolling rate limits
 
-All limits are evaluated over a **rolling 24-hour window**, not a calendar day. Counters derive
-from timestamps already in the ledger — there is no separate counter file and no in-memory counter.
+All limits are evaluated over a **rolling 24-hour window**, not a calendar day. Every online
+action is reserved before the browser request in `data/budget.<port>.json`, so failed requests are
+counted too.
 
 | Gate | Search pages | Job-detail reads | Sends |
 |---|---|---|---|
@@ -54,13 +55,13 @@ Stop all online actions for the affected account immediately when any of these c
 
 Do not retry through a different browser surface, account, internal API, or automation framework.
 
-### Persistent Circuit Breaker Lock (`lock.json`)
+### Persistent Circuit Breaker Lock (`lock.<port>.json`)
 
 When a hard stop condition (such as security verification, 403, passport exception, code 32/36/37,
 3 consecutive blank JDs, or a rate-limit hard ceiling) is detected, the runtime automatically
-writes a persistent circuit breaker lock file (`data/lock.json`).
+writes a persistent per-account circuit breaker lock file (`data/lock.<port>.json`).
 
-While `lock.json` exists:
+While the account's `lock.<port>.json` is locked:
 - All online commands (`check`, `replies`, `interactions`, `search`, `candidates`, `read`, `send`, `verify-delivery`, `company-jobs`, etc.) will immediately refuse to run.
 - Switching scripts, restarting the process, or clearing chat context will NOT bypass the lock.
 
@@ -93,7 +94,7 @@ After unlocking, perform a single human-supervised minimal check (`node scripts/
 Require all of the following:
 
 1. complete structured JD (automatically skipping closed positions);
-2. configured requirements reviewed with evidence (`review`);
+2. target-role fit, location/work-mode, pay, and risk reviewed with evidence (`review`);
 3. no prior conversation with the recruiter (`encryptBossId` deduplication);
 4. current page still matches the reviewed job and JD hash;
 5. opener saved via `save-opener` using only confirmed facts;
