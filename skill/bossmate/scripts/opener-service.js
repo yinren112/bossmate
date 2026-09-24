@@ -31,10 +31,13 @@ function assertAgentReady(ledger, job) {
   if (reason) throw new Error(reason);
 }
 
-// 审核所需的最小载荷：agent 判断 fit/location/pay/risk 需要的字段 + JD 正文，一次给全。
-// 没有这个出口时，agent 想审岗必须先看 JD，想看 JD（opener-context）又必须先审完岗，
-// 唯一出路是直接去读 data/ledger.json——而台账每个岗位约 5KB，几百个岗位就足以塞爆上下文。
-// 这个函数存在的意义就是让"读台账"永远没有必要。
+// The minimal payload needed for review: the fields the agent needs to judge
+// fit/location/pay/risk, plus the JD body, given all at once.
+// Without this, reviewing a job requires reading the JD first, and reading the JD
+// (opener-context) requires the review to be done first - the only way out would be
+// reading data/ledger.json directly, and at ~5KB per job the ledger can blow the
+// context with just a few hundred jobs. This function exists so "read the ledger"
+// is never necessary.
 function reviewPayload(job) {
   const structured = job.jd?.structured || {};
   return {
@@ -55,8 +58,8 @@ function reviewPayload(job) {
   };
 }
 
-// 离线复看已读过的 JD，不联网、不占速率闸门。
-// 用于 agent 上下文被压缩后重新拿回某个岗位的正文，而不是去翻台账。
+// Offline re-read of a JD already fetched - no network call, no rate limit usage.
+// Used to recover a job's body after the agent's context gets compressed, instead of digging through the ledger.
 function showJd() {
   const input = process.argv[3] || arg('url');
   const id = jobIdOf(input) || input;
@@ -70,18 +73,19 @@ function showJd() {
 
 
 
-// 只识别无法在当前页面关闭的硬性拦截；"完善在线简历"的"好的"提示会在发送页内关闭后继续。
+// Only flags hard blocks that can't be dismissed on the current page; the "complete your online resume" / "OK" prompt gets dismissed inline and the flow continues.
 function detectSendBlock(text) {
   if (!text) return '';
   if (/交换(微信|手机号)|请先绑定(微信|手机)|先交换/.test(text)) return 'BOSS 要求先交换联系方式才能沟通';
   return '';
 }
 
-// brief=true 时省掉 userProfile 和 description 两个字段。
-// 这两块在一轮工作流里都是重复内容：JD 正文 agent 刚在 read --jd 里看过，
-// 事实档案（profile.md）整个 session 一个字都不会变，却被每个岗位重发一次——
-// 处理几十个岗位时，光这两项就占掉总载荷的一半以上。
-// brief 模式要求调用方确保 profile.md 已在本 session 加载过一次。
+// With brief=true, drop the userProfile and description fields.
+// Both are duplicated within a single workflow: the agent just saw the JD body
+// in read --jd, and the fact profile (profile.md) never changes within a session
+// yet gets resent for every job - across a few dozen jobs these two alone make up
+// more than half the total payload.
+// Brief mode requires the caller to have already loaded profile.md once this session.
 function buildOpenerContext(job, profileId, brief = false) {
   const profile = PROFILES[profileId] || PROFILES[matchProfile(job.title, job.jd?.structured?.description || '')];
   if (!profile) throw new Error('岗位未匹配用户配置的求职方向，不能生成开场白');

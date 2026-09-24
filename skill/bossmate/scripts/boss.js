@@ -227,8 +227,9 @@ const input = positional() || arg('url');
     }
     job.sources = [...new Set([...(job.sources || []), arg('source') || 'manual'])];
     saveLedger(ledger);
-    // --jd 直接带出审核所需的全部字段（含 JD 正文），省掉紧接着的第二次命令往返；
-    // 审岗本来就必须看正文，把它拆成两次调用只是多花一轮工具开销。
+    // --jd returns all fields needed for review (including the JD body) in one go,
+    // skipping a second round trip. Reviewing a job requires reading the body anyway,
+    // so splitting it into two calls just costs an extra tool call.
 if (hasFlag('jd')) {
       console.log(JSON.stringify(reviewPayload(job), null, 2));
     } else {
@@ -314,9 +315,11 @@ if (hasFlag('has-remote')) {
   rows.slice(0, limit).forEach(job => console.log(`- [${tag}] ${job.jobId} ${job.salary || '薪资未知'} ${job.title} @ ${job.company}${job.opener?.message ? ' [有开场白]' : ''}${remoteHits.has(job.jobId) ? ` ｜远程原句：${remoteHits.get(job.jobId)}` : ''}`));
 }
 
-// 开场自检合并成一条命令：原来要跑 self-test/validate/check/replies/interactions/list/rate-status
-// 七次，七份各自的样板输出和七轮工具调用开销，而其中绝大部分内容每次都一样。
-// 这里只输出"本轮真正要做决定所需"的信息：能不能跑、跑到哪了、有什么在等着处理。
+// Merges the startup checks into one command. Previously this meant running
+// self-test/validate/check/replies/interactions/list/rate-status separately -
+// seven calls with seven sets of boilerplate output that mostly repeat each other.
+// This only prints what's actually needed to decide the next move: can it run,
+// where things stand, and what's waiting.
 async function preflight() {
   const ledger = loadLedger();
   const lock = loadLock();
@@ -415,7 +418,7 @@ async function sendMessage(url, message) {
     return;
   }
 
-  // 静态去重命中时不联网、不占速率闸门；真要发才计入 sends
+  // A static dedup hit doesn't go online or count against the rate limit; only an actual send counts toward sends
   await reserveAction('sends', `${id} ${job.title}`, BUDGET_FILE, ['jobReads']);
   const { openTab, closeTab } = cdpLib();
   const cdp = await openTab(url, PORT);
@@ -432,8 +435,8 @@ async function sendMessage(url, message) {
       return;
     }
     if (jobIdOf(preflight.url) !== id || !preflight.button?.text) throw new Error('发送前岗位页或沟通按钮核验失败');
-    // 发送前会重新加载一次详情页，BOSS 那边照样算一次详情页浏览；
-    // 只记 sends 而不记这次浏览，会让 jobReads 的 24 小时总量算少。
+    // Reloading the detail page before sending still counts as a page view on BOSS's side;
+    // recording only sends and not this view would undercount jobReads' 24-hour total.
     job.jd.liveCheckedAt = now();
     const actual = normalizeStructuredPage(preflight);
     if (actual.structured.incomplete) throw new Error('发送前 JD 变为不完整，已停止');
@@ -452,11 +455,12 @@ async function sendMessage(url, message) {
       return;
     }
     await cdp.eval(`document.querySelector('.btn-startchat').click();true`);
-    // 轮询等待聊天页就绪：不再用固定 sleep，避免偶发加载慢 / 弹窗延后注入导致 chat-not-ready。
+    // Poll until the chat page is ready instead of a fixed sleep, to avoid chat-not-ready
+    // from occasional slow loads or a popup injected late.
     let chatReady = false;
     for (let i = 0; i < 25; i++) {
       await humanPause(800, 1400);
-      // 每次轮询都尝试关闭“号码隐私保护/安全风险”安全弹窗（可能多次注入）
+      // Try to close the "number privacy protection / security risk" popup on every poll (it can be injected more than once)
       await cdp.eval(`(function(){const cancel=[...document.querySelectorAll('button,a,span')].find(x=>{const t=(x.innerText||'').trim();return t==='取消'&&/隐私保护|安全风险/.test(document.body.innerText);});if(cancel){cancel.click();return 'closed';}return 'none';})()`);
 
       const dismissedResumeNotice = await cdp.eval(`(function(){const body=document.body.innerText||'';if(!/完善在线简历|请先完善(在线)?简历|简历不完整|去完善简历|完善简历后/.test(body))return false;const ok=[...document.querySelectorAll('button,a,span')].find(x=>x.offsetParent&&(x.innerText||'').trim()==='好的');if(!ok)return false;ok.click();return true;})()`);
@@ -464,7 +468,7 @@ async function sendMessage(url, message) {
 
       const probe = await cdp.eval(`(function(){try{return {input:!!document.querySelector('#chat-input'),chat:location.href.includes('/web/geek/chat'),text:document.body.innerText};}catch(e){return {input:false,chat:false,text:''};}})()`);
       if (probe && probe.input && probe.chat) { chatReady = true; break; }
-      // 检测 BOSS 硬性拦截（如交换联系方式），拦截则优雅跳过，不进 delivery_unverified 死循环
+      // Detect a hard block from BOSS (e.g. asking to exchange contact info) and skip cleanly instead of looping into delivery_unverified
       const block = detectSendBlock(probe ? (probe.text || '') : '');
       if (block) {
         job.outreach = { status: 'blocked', message, evidencePath: '', verify: null, target: { title: job.title, company: job.company }, sentAt: now() };
@@ -476,7 +480,7 @@ async function sendMessage(url, message) {
       }
     }
     if (!chatReady) {
-      // 最终再判一次是否 BOSS 拦截（而非单纯加载慢）
+      // One last check for a BOSS block (as opposed to just a slow load)
       const finalText = await cdp.eval(`document.body.innerText`).catch(() => '');
       const block = detectSendBlock(finalText || '');
       if (block) {
@@ -498,7 +502,7 @@ async function sendMessage(url, message) {
         return { error: 'already-communicated' };
       }
       const msg=${JSON.stringify(message)};
-      // 发送前再关一次可能遮挡输入框的“号码隐私保护”安全弹窗
+      // Close the "number privacy protection" popup again right before sending, in case it's covering the input box
       const pv=[...document.querySelectorAll('button,a,span')].find(x=>{const t=(x.innerText||'').trim();return t==='取消'&&/隐私保护|安全风险/.test(document.body.innerText);});if(pv)pv.click();
       await new Promise(r=>setTimeout(r,300));
       const input=document.querySelector('#chat-input');
@@ -643,7 +647,7 @@ async function selfTest({ quiet = false } = {}) {
   assert.match(unreadableJobMessage({bodyText: '登录查看完整内容'}), /登录态失效/);
   assert.match(unreadableJobMessage({bodyText: '正常'}), /JD 正文在 12 秒内未渲染/);
 
-  // ── 24 小时滚动速率闸门 ──
+  // -- 24-hour rolling rate limit --
   const stamp = minutesAgo => new Date(Date.now() - minutesAgo * 60000).toISOString();
   const tmpBudgetFile = path.join(os.tmpdir(), `bossmate-selftest-budget-${process.pid}.json`);
   const tmpLockFile = path.join(os.tmpdir(), `bossmate-selftest-lock-${process.pid}.json`);
@@ -679,17 +683,17 @@ async function selfTest({ quiet = false } = {}) {
   fs.rmSync(tmpBudgetFile, { force: true });
   fs.rmSync(tmpLockFile, { force: true });
 
-  // 深夜只压节奏、不压总量
+  // Late night only slows the pace, doesn't cut the total
   assert.equal(isNightHour(new Date(2026, 0, 1, 23, 30)), true);
   assert.equal(isNightHour(new Date(2026, 0, 1, 3, 0)), true);
   assert.equal(isNightHour(new Date(2026, 0, 1, 14, 0)), false);
   assert.equal(paceMultiplier(new Date(2026, 0, 1, 23, 30)), NIGHT_PACE);
   assert.equal(paceMultiplier(new Date(2026, 0, 1, 14, 0)), 1);
 
-  // 随机抖动：连续抽样不能全一样，否则又退化成固定间隔
+  // Random jitter: consecutive samples can't all be the same, or it degrades back into a fixed interval
   assert.equal(new Set(Array.from({ length: 20 }, () => rndInt(3000, 6500))).size > 1, true);
 
-  // ── 审核载荷与上下文瘦身 ──
+  // -- review payload and context trimming --
   const payloadJob = blankJob('payload');
   payloadJob.title = '岗位标题';
   payloadJob.company = '某公司';
@@ -699,7 +703,7 @@ async function selfTest({ quiet = false } = {}) {
     structured: { description: '岗位正文内容', experience: '1-3年', education: '本科', salary: '20-30K', benefits: '远程', incomplete: false },
   };
   const payload = reviewPayload(payloadJob);
-  // 审岗所需字段必须一次给全，否则 agent 只能回去读台账
+  // All fields needed to review a job must be given at once, or the agent has to go back and read the ledger
   for (const field of ['description', 'remoteHint', 'salary', 'experience', 'education', 'recruiterActive', 'review', 'outreachStatus']) {
     assert(field in payload, `reviewPayload 缺少审核所需字段 ${field}`);
   }
@@ -723,7 +727,7 @@ async function selfTest({ quiet = false } = {}) {
   assert.equal(preScreenJob(preScreenLedger, remoteHintJob, { title: '软件开发', text: '软件开发岗位，支持远程办公' }, 'primary').status, 'priority');
   Object.assign(PREFERENCES.requirements, originalRequirements);
 
-  // --brief 必须去掉重复的 JD 正文和事实档案，且不能因此丢掉写开场白必需的字段
+  // --brief must drop the duplicated JD body and fact profile, without losing fields needed to write the opener
   PROFILES['brief_mock'] = { label: 'Brief', titleKeywords: ['岗位标题'], jdKeywords: [], factFocus: '选最相关的一项' };
   const fullCtx = buildOpenerContext(payloadJob, 'brief_mock', false);
   const briefCtx = buildOpenerContext(payloadJob, 'brief_mock', true);
@@ -737,7 +741,7 @@ async function selfTest({ quiet = false } = {}) {
   assert(JSON.stringify(briefCtx).length < JSON.stringify(fullCtx).length, '--brief 必须更小');
   delete PROFILES['brief_mock'];
 
-  // 风控级熔断当天不得解锁；普通异常和超过 24 小时的旧锁可以正常解
+  // A risk-control lock can't be unlocked the same day; ordinary errors and locks older than 24 hours can be unlocked normally
   const severeLock = { locked: true, reason: '访问受限：账户存在异常行为', evidence: '', lockedAt: new Date().toISOString() };
   assert.match(unlockRefusal(severeLock), /当天不得解锁/);
   assert.equal(unlockRefusal({ ...severeLock, lockedAt: new Date(Date.now() - 3 * WINDOW_24H).toISOString() }), '');
@@ -855,7 +859,7 @@ if (['check', 'replies', 'interactions', 'profile', 'search', 'read', 'review', 
   assertConfigured();
 }
 if (ONLINE_COMMANDS.has(command)) assertNotLocked();
-// preflight 自己就要负责报告"是否被锁"，所以不能被锁挡在门外；
-// jd 是纯离线复看，上下文被压缩后正需要它在锁定期间也能取回正文。
+// preflight itself is responsible for reporting whether it's locked, so it can't be blocked by the lock;
+// jd is purely an offline re-read - it's exactly what's needed to recover the JD body after context gets compressed, even while locked.
 if (['preflight', 'jd'].includes(command)) assertConfigured();
 Promise.resolve(commands[command]()).catch(error => { console.error(`ERROR: ${error.message}`); process.exit(1); });
