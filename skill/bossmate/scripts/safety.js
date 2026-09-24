@@ -1,33 +1,37 @@
 const fs = require('fs');
 const path = require('path');
-const { DATA_DIR, LEDGER_FILE, PORT, now, rel } = require('./runtime-config');
+const { DATA_DIR, LEDGER_FILE, PORT, DEFAULT_CDP_PORT, now, rel } = require('./runtime-config');
 const { loadLedger } = require('./ledger-store');
 const { arg, hasFlag } = require('./cli-args');
 
-// ── 拟人节奏：所有等待都用随机区间，不用固定常数 ──
-// 固定间隔的等待是脚本化访问最容易被识别的特征之一——真人不会连续两次停顿完全相同的毫秒数。
+// ── Randomized pacing: all waits use a random range, never a fixed constant ──
+// A fixed wait interval is easy to distinguish from normal, organic usage; varying the interval
+// keeps traffic gentle on the service and reduces the odds of tripping the site's rate limits.
 const sleepMs = ms => new Promise(resolve => setTimeout(resolve, Math.max(0, ms)));
 const rndInt = (lo, hi) => lo + Math.floor(Math.random() * (Math.max(hi, lo) - lo + 1));
 const humanPause = (lo, hi) => sleepMs(rndInt(lo, hi));
 
 const WINDOW_24H = 24 * 60 * 60 * 1000;
 const WINDOW_10MIN = 10 * 60 * 1000;
-// 深夜时段自动减速而不是禁止：既降低连续高强度访问的风险特征，也不强行打断用户自己的作息。
+// Slow down automatically at night instead of blocking outright: this keeps overall traffic
+// lighter during off-peak hours without forcibly interrupting a user who genuinely works late.
 const NIGHT_START_HOUR = 23; // 23:00
 const NIGHT_END_HOUR = 9;    // 09:00
-const NIGHT_PACE = 2;        // 深夜最小间隔翻倍、突发上限减半；24 小时总额度不变
+const NIGHT_PACE = 2;        // Night: double the minimum gap, halve the burst limit; 24h total unchanged
 const isNightHour = (date = new Date()) => { const h = date.getHours(); return h >= NIGHT_START_HOUR || h < NIGHT_END_HOUR; };
 const paceMultiplier = (date = new Date()) => (isNightHour(date) ? NIGHT_PACE : 1);
 
-// ── 账号级熔断锁与安全检测 ──
+// ── Account-level circuit-breaker lock and safety-page detection ──
 const LOCK_FILE = path.join(DATA_DIR, `lock.${PORT}.json`);
 const LEGACY_LOCK_FILE = path.join(DATA_DIR, 'lock.json');
 const BUDGET_FILE = path.join(DATA_DIR, `budget.${PORT}.json`);
-// BOSS 会在安全复核通过后保留 `_security_check=...` 参数；裸子串不是风控证据。
+// BOSS keeps a `_security_check=...` param around after a security review passes; the bare
+// substring alone is not evidence of a restriction.
 const SECURITY_PAGE_RE = /captcha|verify|\/403\.html|[?&]code=(32|36|37)(?:&|$)|\/web\/passport\/|账户存在异常行为|暂时限制访问|访问受限/i;
 const SECURITY_JS_EXPR = "(location.href.includes('/403.html')||/[?&]code=(32|36|37)(&|$)/.test(location.href)||location.href.includes('/web/passport/')||!!document.querySelector('.security-check,.verify-wrap,.captcha')||/账户存在异常行为|暂时限制访问|访问受限/.test(document.body.innerText||''))";
-// 这些信号代表平台自己的风控已经判定过一次，而不是普通的加载失败或页面异常；
-// 出现后当天继续访问正是多起真实受限事件里共同的失败路径（信号出现后又继续访问几次，随后升级为账号级限制）。
+// These signals mean the site's own restriction system has already flagged the account once;
+// it is not an ordinary load failure or page glitch. Continuing to browse the same day after one
+// of these appears is the pattern most associated with an account-level restriction that follows.
 const SEVERE_LOCK_RE = /code=(?:32|36|37)|访问受限|账户存在异常|暂时限制访问|环境存在异常/;
 const ONLINE_COMMANDS = new Set([
   'check', 'replies', 'interactions', 'profile', 'favorites', 'favorites-next',
@@ -36,20 +40,22 @@ const ONLINE_COMMANDS = new Set([
 ]);
 const MAX_CONSECUTIVE_EMPTY_JD = 3;
 
-// ── 24 小时滚动速率闸门 ──
-// 真实受限案例里，详情页阅读量在同一账号单日约 1000 次左右就会触发访问限制，
-// 而对照的低量账号（几百次/日）当天没有异常；发送侧观察到的量级在 150 上下。
-// 下面的 hardCeiling24h 是留出安全余量后的保险丝，不是"可以放心用满"的目标值；
-// 日常运行应该长期停在 softLimit24h 以下，只有账号观察稳定几天后再考虑上调。
-// 三层闸门里，总量（24h）和密度（10min）超限会直接拒绝；只有"两次动作间隔不够"
-// 会自动等待补足，不会报错——间隔问题是节奏问题，不是异常，不该让脚本直接失败。
+// ── 24-hour rolling rate gate ──
+// Job-detail-page reads in the low thousands per day are commonly associated with restrictions
+// on this kind of site; staying well under that with a comfortable margin is the safer default.
+// hardCeiling24h below already includes that margin — it is a fuse, not a target to run up to.
+// Normal operation should sit well under softLimit24h; only raise it after several days of
+// stable, unrestricted use.
+// Of the three gates, exceeding the 24h total or the 10-minute density gate rejects the action
+// outright; only "gap between two actions too short" waits automatically instead of failing —
+// that's a pacing issue, not an anomaly, so it shouldn't hard-fail the script.
 const RATE_LIMITS = {
   searchPages: { softLimit24h: 30, hardCeiling24h: 120, burstLimit10min: 6, minGapMs: 15000 },
   jobReads: { softLimit24h: 300, hardCeiling24h: 900, burstLimit10min: 40, minGapMs: 8000 },
   sends: { softLimit24h: 30, hardCeiling24h: 150, burstLimit10min: 6, minGapMs: 25000 },
 };
 
-// 仅用于第一次升级时把现有台账时间戳迁入预算文件。
+// Only used on first upgrade, to migrate existing ledger timestamps into the budget file.
 function recentTimestamps(ledger, kind) {
   if (kind === 'jobReads') return (ledger.jobs || []).flatMap(j => [j.jd?.checkedAt, j.jd?.liveCheckedAt]).filter(Boolean);
   if (kind === 'searchPages') return (ledger.runs || []).filter(r => r.type === 'search').map(r => r.at).filter(Boolean);
@@ -64,7 +70,7 @@ function loadLock(file = LOCK_FILE) {
   if (file === LOCK_FILE) {
     try {
       const legacy = JSON.parse(fs.readFileSync(LEGACY_LOCK_FILE, 'utf8'));
-      if (legacy && (Number(legacy.port) || 9222) === PORT) return { ...legacy, fromLegacyFile: true };
+      if (legacy && (Number(legacy.port) || DEFAULT_CDP_PORT) === PORT) return { ...legacy, fromLegacyFile: true };
     } catch {}
   }
   return { locked: false };
@@ -87,9 +93,11 @@ function throwSecurity(reason, evidence = '', file = LOCK_FILE) {
   throw new Error(`${reason}，已停止并写入熔断锁 ${rel(LOCK_FILE)}；人工确认前所有在线命令拒绝运行`);
 }
 
-// 平台级风控信号（code=32/36/37、访问受限等）当天不得解锁续跑：真实受限事件的共同失败路径
-// 就是"信号出现后继续访问几次"，而不是单次请求本身。普通异常（如 check 偶然发现的加载失败）
-// 不受此限制，可以随时解锁。
+// A platform-level restriction signal (code=32/36/37, access-restricted, etc.) cannot be
+// unlocked the same day it fires: the pattern most associated with a follow-on restriction is
+// continuing to browse a few more times after the signal appears, not the single request itself.
+// Ordinary errors (e.g. a load failure that `check` happens to notice) are not subject to this
+// and can be unlocked at any time.
 function unlockRefusal(previous, at = Date.now()) {
   if (!previous?.locked) return '';
   if (!SEVERE_LOCK_RE.test(`${previous.reason || ''} ${previous.evidence || ''}`)) return '';
@@ -101,8 +109,9 @@ function unlockRefusal(previous, at = Date.now()) {
   return `平台级风控信号当天不得解锁续跑：${previous.reason}，锁定于 ${previous.lockedAt}，最早可解锁 ${earliest}。确需提前解锁请加 --override-severe-lock 参数并自负风险`;
 }
 
-// 注意：这个开关只越过"风控级熔断当天冷静期"，不涉及发送、去重或送达核验任何一道门禁——
-// 那几道门禁本来就没有、也不该有绕过开关。
+// Note: this flag only bypasses the same-day cooldown on a restriction-level lock. It does not
+// touch send, dedup, or delivery-verification gates — those never had, and shouldn't have, a
+// bypass switch.
 function unlock() {
   const reason = arg('reason');
   if (!reason) throw new Error('解锁必须由人工给出 --reason=说明');
@@ -152,7 +161,8 @@ function lastActionAt(budget) {
   return times.length ? Math.max(...times) : 0;
 }
 
-// 在联网前预记动作；失败访问也会占用平台额度。发送会连带预记一次详情页读取。
+// Record the action before it goes online; a failed request still counts against the quota.
+// A send also pre-records one job-detail-page read alongside it.
 async function reserveAction(kind, detail = '', file = BUDGET_FILE, alsoCount = [], lockFile = LOCK_FILE) {
   const budget = loadBudget(file);
   const pace = paceMultiplier();

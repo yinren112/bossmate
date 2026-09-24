@@ -9,11 +9,12 @@ bug or intentional.
 Anti-abuse detection does not evaluate single requests in isolation. It looks at volume, density,
 and rhythm over time.
 
-Reports from real accounts consistently place the risk threshold for job-detail-page reads
-somewhere around 1,000 per day, and outreach sends somewhere around 150 per day. An account well
-under those numbers with no prior restriction history tends to run without incident. An account
-that reaches those levels tends to get restricted — and the threshold appears to drop for a repeat
-account, or for one that already produced a warning signal earlier the same day.
+Job-detail-page reads in the low thousands per day, and outreach sends in the low hundreds per
+day, are commonly associated with restrictions on this kind of site. Staying well under those
+levels with no prior restriction history is the safer pattern. The threshold that triggers a
+restriction also appears to drop for a repeat account, or for one that already produced a warning
+signal earlier the same day — so the limits here are meant to keep normal usage comfortably clear
+of that range rather than to hug it.
 
 Detection is also retrospective rather than real-time. A session can finish cleanly with no errors
 and the restriction can still land hours later the same evening. **"Nothing errored yet" is not
@@ -66,9 +67,10 @@ ceiling under-count and let real traffic exceed the fuse it was supposed to enfo
 
 ## Why the severe-lock cooldown blocks same-day unlocking
 
-In the incidents behind this design, the request that tripped the platform's signal was not what
-caused the account-level restriction. What caused it was continuing to browse a few more times
-*after* the signal appeared — turning a throttled endpoint into a restricted account.
+The design principle here: the single request that trips the platform's signal is generally not
+what causes an account-level restriction by itself. What tends to cause it is continuing to
+browse a few more times *after* the signal appears — turning a throttled endpoint into a
+restricted account.
 
 So a lock whose reason indicates the platform's own anti-abuse system fired (code 32/36/37,
 access-restricted, account anomaly) refuses to unlock until 24 hours have passed *and* the
