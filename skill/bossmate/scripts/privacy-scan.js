@@ -1,17 +1,12 @@
 #!/usr/bin/env node
 const fs = require('fs');
 const path = require('path');
+const { getPatterns } = require('./privacy-patterns');
 
 const root = path.resolve(__dirname, '..');
-const skip = new Set(['privacy-scan.js']);
-const patterns = [
-  ['private-windows-path', /C:\\Users\\/i],
-  ['source-workspace', /D:\\example-workspace/i],
-  ['private-username', /example-user/i],
-  ['private-portfolio', /example-portfolio/i],
-  ['phone-number', /(?:\+?86[-\s]?)?1[3-9]\d{9}/],
-  ['id-card-number', /\b\d{17}[\dXx]\b/],
-];
+const repoRoot = path.resolve(__dirname, '..', '..', '..');
+const skip = new Set(['privacy-scan.js', 'privacy-patterns.js']);
+const patterns = getPatterns(repoRoot);
 const hits = [];
 
 function walk(dir) {

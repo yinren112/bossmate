@@ -130,7 +130,7 @@ try {
   const rehashedLedger = JSON.parse(fs.readFileSync(ledgerFile, 'utf8'));
   assert.notEqual(rehashedLedger.jobs[0].jd.hash, 'fixture-hash');
 
-  // jd：离线取回审核所需的全部字段（含正文），让 agent 永远不必去读 ledger.json
+  // jd: offline fetch of all fields needed for review (including the body), so the agent never has to read ledger.json
   result = run('boss.js', ['jd', 'fixture-job']);
   assert.equal(result.status, 0, result.stderr);
   const jdPayload = JSON.parse(result.stdout);
@@ -164,7 +164,7 @@ try {
   assert.match(result.stdout, /Built and shipped one real software project/);
   const fullContextSize = result.stdout.length;
 
-  // --brief 去掉重复的事实档案和 JD 正文，但保留写开场白必需的字段
+  // --brief drops the duplicated fact profile and JD body, but keeps the fields needed to write the opener
   result = run('boss.js', ['opener-context', 'fixture-job', '--brief']);
   assert.equal(result.status, 0, result.stderr);
   assert(!/Built and shipped one real software project/.test(result.stdout), '--brief must not resend the fact profile');
@@ -187,7 +187,7 @@ try {
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /VALID/);
 
-  // preflight 汇总本轮所需状态；即使浏览器不可达（CI 环境）也必须给出可解析的报告而不是崩掉
+  // preflight summarizes the state needed for this round; even when the browser is unreachable (CI environment) it must return a parseable report instead of crashing
   result = run('boss.js', ['preflight']);
   const preflightReport = JSON.parse(result.stdout);
   assert(preflightReport.rate, 'preflight must report rate-limit state');
@@ -199,6 +199,45 @@ try {
   assert(!source.includes('assertApprovalReady'), 'obsolete approval gate must not return');
   assert(!/codex(?:\.ps1)?/i.test(source), 'runtime must not invoke Codex');
   assert(!/C:[/\\]Users[/\\]/i.test(source), 'runtime must not contain a private Windows path');
+
+  // privacy-scan.js and release-check.js must only ship generic patterns; anything
+  // person- or machine-specific has to come from BOSSMATE_PRIVATE_PATTERNS or
+  // .privacy-patterns.local, never be hardcoded in tracked source. We check this
+  // structurally (only BASE_PATTERNS ship, extras only come from env/file) instead
+  // of asserting against literal private strings, so this test file itself never
+  // has to carry anyone's real identity as a substring.
+  const { BASE_PATTERNS } = require('./privacy-patterns');
+  assert(
+    BASE_PATTERNS.every(([name]) => !/private-username|private-workspace|private-portfolio|source-workspace/.test(name)),
+    'privacy-patterns.js must not ship a person-specific pattern name in its base set'
+  );
+
+  {
+    const { getPatterns } = require('./privacy-patterns');
+    const patternsHome = fs.mkdtempSync(path.join(os.tmpdir(), 'bossmate-privacy-'));
+    const synthToken = 'ACME-SYNTH-SECRET-TOKEN';
+    process.env.BOSSMATE_PRIVATE_PATTERNS = synthToken;
+    fs.writeFileSync(path.join(patternsHome, '.privacy-patterns.local'), 'local-only-synthetic-marker\n');
+    let patterns;
+    try {
+      patterns = getPatterns(patternsHome);
+    } finally {
+      delete process.env.BOSSMATE_PRIVATE_PATTERNS;
+      fs.rmSync(patternsHome, { recursive: true, force: true });
+    }
+    assert(
+      patterns.some(([, re]) => re.test(`a leaked value ${synthToken} appeared here`)),
+      'privacy patterns must pick up BOSSMATE_PRIVATE_PATTERNS'
+    );
+    assert(
+      patterns.some(([, re]) => re.test('this text contains local-only-synthetic-marker inline')),
+      'privacy patterns must pick up .privacy-patterns.local'
+    );
+    assert(
+      patterns.every(([, re]) => !re.test('a perfectly ordinary sentence with nothing sensitive in it')),
+      'a plain sentence must not trigger any privacy pattern'
+    );
+  }
 
   console.log('TEST_OK setup + browser launcher + review + opener + direct-send gates + validation');
 } finally {

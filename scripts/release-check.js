@@ -1,20 +1,15 @@
 const fs = require('fs');
 const path = require('path');
+const { getPatterns } = require('../skill/bossmate/scripts/privacy-patterns');
 
 const root = path.resolve(__dirname, '..');
 const skipDirs = new Set(['.git', 'node_modules', 'output']);
 const skipFiles = new Set([
   path.resolve(__filename),
   path.join(root, 'skill', 'bossmate', 'scripts', 'privacy-scan.js'),
+  path.join(root, 'skill', 'bossmate', 'scripts', 'privacy-patterns.js'),
 ]);
-const patterns = [
-  ['private-windows-path', /C:\\Users\\/i],
-  ['private-workspace', /D:\\example-workspace/i],
-  ['private-username', /example-user/i],
-  ['private-portfolio', /example-portfolio/i],
-  ['phone-number', /(?:\+?86[-\s]?)?1[3-9]\d{9}/],
-  ['id-card-number', /\b\d{17}[\dXx]\b/],
-];
+const patterns = getPatterns(root);
 const hits = [];
 
 function walk(dir) {

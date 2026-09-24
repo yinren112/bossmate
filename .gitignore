@@ -4,3 +4,4 @@ output/
 tasks/
 .DS_Store
 Thumbs.db
+.privacy-patterns.local
