@@ -1,7 +1,6 @@
-// 仅使用 Node.js 22+ 自带 WebSocket 的裸 CDP 客户端。
+// Minimal CDP client using Node.js 22+'s built-in WebSocket, no dependencies.
 const http = require('http');
-
-const DEFAULT_PORT = Number(process.env.BOSS_CDP_PORT || 9222);
+const { PORT: DEFAULT_PORT } = require('./runtime-config');
 
 function request(method, requestPath, port = DEFAULT_PORT) {
   return new Promise((resolve, reject) => {
